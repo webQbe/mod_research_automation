@@ -33,3 +33,9 @@ const SPREADSHEET_ID = 'google_sheet_id';
   "filePushOrder": []
 }
 ```
+
+#### `poc-worker/` module
+`poc-worker/.env` file:
+```
+HEADLESS=0
+```
