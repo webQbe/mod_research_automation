@@ -1,10 +1,11 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const { parseAbbreviatedNumber, formatWithCommas } = require('./utils/abbrev-number');
+const { screenshotFilePath } = require('./fileHelper');
 
 
 const HEADLESS = process.env.HEADLESS !== '0'; // set HEADLESS=0 to see the browser
-const ZIP = '90001';
+const ZIP = '10022';
 const MAX_RESULTS = 5;
 const AMAZON_BASE = 'https://www.amazon.com';
 
@@ -185,6 +186,96 @@ async function trySelectorsAttr(parent, selectors, attr) {
   return null;
 }
 
+// Call: await handleTopRegionPopup(page);
+// Returns: true if popup handled (clicked/closed), false otherwise
+async function handleTopRegionPopup(page) {
+  try {
+    // quick presence check for the top popup container
+    const topPopup = page.locator('xpath=/html/body/div[7]');
+    if (!(await topPopup.count())) return false;
+
+    console.log('[popup] Top region popup detected (div[7])');
+
+    // Preferred: click "Go to Amazon.com" button
+    const goToXpath = '/html/body/div[7]/div[4]/div[3]/a/span[2]';
+    const goToBtn = page.locator(`xpath=${goToXpath}`);
+    if (await goToBtn.count() > 0) {
+      console.log('[popup] Clicking "Go to Amazon.com" button (xpath)...');
+      await removeOverlayIfPresent(page);
+      let ok = await safeClick(page, goToBtn, { timeout: 8000 });
+      if (!ok) {
+        // fallback: direct DOM click
+        try {
+          const h = await goToBtn.first().elementHandle();
+          if (h) await page.evaluate(el => el.click(), h);
+          ok = true;
+        } catch (e) { /* ignore */ }
+      }
+      if (ok) {
+        await page.waitForTimeout(1200);
+        console.log('[popup] Clicked Go-to button');
+        return true;
+      }
+    }
+
+    // Secondary: click close button on popup
+    const closeXpath = '/html/body/div[7]/div[1]/span[2]/a/span';
+    const closeBtn = page.locator(`xpath=${closeXpath}`);
+    if (await closeBtn.count() > 0) {
+      console.log('[popup] Clicking popup close button (xpath)...');
+      await removeOverlayIfPresent(page);
+      let ok2 = await safeClick(page, closeBtn, { timeout: 8000 });
+      if (!ok2) {
+        try {
+          const h2 = await closeBtn.first().elementHandle();
+          if (h2) await page.evaluate(el => el.click(), h2);
+          ok2 = true;
+        } catch (e) { /* ignore */ }
+      }
+      if (ok2) {
+        await page.waitForTimeout(700);
+        console.log('[popup] Popup closed via close button');
+        return true;
+      }
+    }
+
+    // If neither button works, try to hide the popup so it doesn't intercept clicks
+    try {
+      console.log('[popup] Disabling pointer events on top popup as last resort');
+      await page.evaluate(() => {
+        const el = document.querySelector('body > div:nth-child(7)');
+        if (el) {
+          el.style.pointerEvents = 'none';
+          el.style.visibility = 'hidden';
+        }
+      });
+      await page.waitForTimeout(400);
+      return true;
+    } catch (e) {
+      // continue to debug capture
+    }
+
+    // If we reach here, record debug artifacts and return false
+    const stamp = Date.now();
+    try {
+      const png = `debug-top-popup-${stamp}.png`;
+      const html = `debug-top-popup-${stamp}.html`;
+      await page.screenshot({ path: png, fullPage: true }).catch(()=>{});
+      const content = await page.content().catch(()=>'<no-html>');
+      require('fs').writeFileSync(html, content);
+      console.warn('[popup] Wrote debug files:', png, html);
+    } catch (err) {
+      console.warn('[popup] Could not write debug artifacts:', err.message);
+    }
+    console.warn('[popup] Top popup present but not handled automatically.');
+    return false;
+  } catch (err) {
+    console.warn('[popup] handleTopRegionPopup error:', err.message || err);
+    return false;
+  }
+}
+
+
 async function runPlaywrightFor(searchTerm) {
   const browser = await chromium.launch({
     headless: HEADLESS,
@@ -200,7 +291,7 @@ async function runPlaywrightFor(searchTerm) {
 
   try {
     // Build search URL
-    const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}`;
+    const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&rh=p_6%3AATVPDKIKX0DER&dc&crid=341Y28BNDVEK3&qid=1769417689&refresh=1&rnid=2661622011&sprefix=anime+isekai+shir%2Caps%2C513&ref=sr_nr_p_6_1&ds=v1%3AIoLNoc5Kc0DelNJ36v6Y96fbJG43zKgZx8C4Fbpu5c4`;
     console.log('Navigating to:', searchUrl);
 
     // Use safe goto with retry/backoff
@@ -210,23 +301,34 @@ async function runPlaywrightFor(searchTerm) {
       // We continue but you may want to abort depending on your workflow
     }
 
-    // ---------- Click "Deliver to" (open the location modal) ----------
-    const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
-    const deliverLocator = page.locator(`xpath=${deliverToXpath}`);
-    if (await deliverLocator.count() > 0) {
-      console.log('Clicking Deliver to button (xpath)...');
-      await deliverLocator.first().click({ timeout: 10000 }).catch(() => { });
-      await page.waitForTimeout(1000);
-    } else {
-      console.log('Deliver-to button not found by given xpath; trying header selector fallback...');
-      const fallback = page.locator('#glow-ingress-block, #nav-global-location-popover-link');
-      if (await fallback.count() > 0) {
-        await fallback.first().click().catch(() => { });
-        await page.waitForTimeout(800);
-      } else {
-        console.log('Could not open Deliver to modal — continuing without setting location.');
+    console.log('Attempting to Enter US Zip');
+
+     // Wait for the location modal to appear (use the modal xpath that Amazon uses)
+    const modalLocator = page.locator('xpath=/html/body/div[18]');
+
+    await modalLocator.waitFor({ timeout: 8000 }).catch( async() => {
+      // If modal didn't appear, try a bit longer and retry Deliver-to click once
+      console.log('Location modal not detected quickly — retrying Deliver-to click and waiting');
+      
+      await handleTopRegionPopup(page);
+      
+      const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
+      const deliver = page.locator(`xpath=${deliverToXpath}`);
+      if (await deliver.count() > 0) {
+        await removeOverlayIfPresent(page);
+        await safeClick(page, deliver, { timeout: 5000 }).catch(()=>{});
+
       }
-    }
+        return modalLocator.waitFor({ timeout: 9000 });
+    });
+
+    // Now modalLocator should represent the modal; take a scoped screenshot for debugging
+    try {
+      const scPath = screenshotFilePath({ dir: 'screenshots', prefix: 'modal-scoped', term: searchTerm });
+      await modalLocator.first().screenshot({ path: scPath }).catch(()=>{});
+      console.log('Modal scoped screenshot:', scPath);
+    } catch(e){ /* ignore */ }
+
 
     // ---------- Enter ZIP code ----------
     const zipSelectors = [
@@ -245,6 +347,8 @@ async function runPlaywrightFor(searchTerm) {
 
     if (!zipLocator) {
       console.warn('ZIP input not found; skipping ZIP entry/apply.');
+        const stamp = Date.now();
+        await page.screenshot({ path: `debug-zip-input-not-opened-${stamp}.png`, fullPage: true }).catch(()=>{});
     } else {
       // Fill the ZIP
       await zipLocator.fill(ZIP).catch(() => { });
@@ -258,6 +362,9 @@ async function runPlaywrightFor(searchTerm) {
         await page.waitForTimeout(1000);
       } catch (e) {
         console.warn('locator.press Enter failed (will try other fallbacks)');
+        const stamp = Date.now();
+        await page.screenshot({ path: `debug-zip-enter-submit-failed-${stamp}.png`, fullPage: true }).catch(()=>{});
+
         // Try 2: focus then page.keyboard.press('Enter')
         try {
           await zipLocator.focus();
@@ -265,6 +372,9 @@ async function runPlaywrightFor(searchTerm) {
           await page.waitForTimeout(1000);
         } catch (e2) {
           console.warn('page.keyboard.press Enter failed (will try form submit/click)');
+          const stamp = Date.now();
+          await page.screenshot({ path: `debug-zip-focus-submit-failed-${stamp}.png`, fullPage: true }).catch(()=>{});
+
           // Try 3: submit the form via DOM (if input is inside a form)
           try {
             await page.evaluate(() => {
@@ -274,6 +384,8 @@ async function runPlaywrightFor(searchTerm) {
             await page.waitForTimeout(1000);
           } catch (e3) {
             console.warn('DOM form.submit() failed (will try clicking apply control)');
+            const stamp = Date.now();
+            await page.screenshot({ path: `debug-zip-dom-submit-failed-${stamp}.png`, fullPage: true }).catch(()=>{});
           }
         }
       }
@@ -302,6 +414,8 @@ async function runPlaywrightFor(searchTerm) {
 
         if (!applied) {
           console.warn('Apply control not found or click failed; attempting JS click fallback.');
+          const stamp = Date.now();
+          await page.screenshot({ path: `debug-no-zip-apply-btn-${stamp}.png`, fullPage: true }).catch(()=>{});
           try {
             await page.evaluate(() => {
               const cand = document.querySelector('input[type="submit"], input#GLUXZipUpdate, button');
@@ -340,43 +454,6 @@ async function runPlaywrightFor(searchTerm) {
     await waitForSearchResultsOrTimeout(page, 30000);
     await page.waitForTimeout(800);
 
-    // ---------- Click sort-by and select "Avg. Customer Review" ----------
-    try {
-      const sortByXpath = '/html/body/div[1]/div[1]/span/div/h1/div/div[4]/div/div/form/span/span/span/span';
-      const sortLocator = page.locator(`xpath=${sortByXpath}`);
-      if (await sortLocator.count() > 0) {
-        await sortLocator.first().click().catch(() => { });
-        await page.waitForTimeout(600);
-      } else {
-        // fallback: try sort select
-        const sortFallback = page.locator('span.a-dropdown-container, span#s-result-sort-select, select[id^="s-result-sort"]');
-        if (await sortFallback.count() > 0) {
-          await sortFallback.first().click().catch(() => { });
-          await page.waitForTimeout(500);
-        } else {
-          console.log('Sort control not found (skipping explicit sort open)');
-        }
-      }
-
-      // Now select "Avg. Customer Review" option — xpath provided
-      const avgReviewXpath = '/html/body/div[18]/div/div/ul/li[4]/a';
-      const avg = page.locator(`xpath=${avgReviewXpath}`);
-      if (await avg.count() > 0) {
-        console.log('Selecting "Avg. Customer Review" via xpath...');
-        await avg.first().click().catch(() => { });
-      } else {
-        // fallback: look for option text
-        const avgFallback = page.locator('a:has-text("Avg. Customer Review"), li:has-text("Avg. Customer Review"), option:has-text("Avg. Customer Review")');
-        if (await avgFallback.count() > 0) {
-          await avgFallback.first().click().catch(() => { });
-        } else {
-          console.log('Avg. Customer Review option not found; skipping sort.');
-        }
-      }
-    } catch (e) {
-      console.warn('Sort-by step failed (ignored):', e.message);
-    }
-
     // Wait a little for results to reload after sorting/ZIP change
     await sleep(1200);
 
@@ -385,6 +462,13 @@ async function runPlaywrightFor(searchTerm) {
     const count = await resultsLocator.count();
     const available = Math.min(count, MAX_RESULTS);
     console.log(`Found ${count} results on page; scraping top ${available}`);
+
+    // Take a page screenshot of loaded results for debugging
+    try {
+      const scPath = screenshotFilePath({ dir: 'screenshots', prefix: 'results', term: searchTerm });
+      await await page.screenshot({ path: scPath }).catch(()=>{});
+      console.log('Results screenshot:', scPath);
+    } catch(e){ /* ignore */ }
 
     const scraped = [];
 
@@ -485,3 +569,6 @@ if (require.main === module) {
     }
   })();
 }
+
+// amazon-scrape.js (export)
+module.exports = { runPlaywrightFor };

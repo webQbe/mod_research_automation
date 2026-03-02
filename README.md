@@ -38,4 +38,6 @@ const SPREADSHEET_ID = 'google_sheet_id';
 `poc-worker/.env` file:
 ```
 HEADLESS=0
+SPREADSHEET_ID=google_sheet_id
+SHEET_NAME=raw_data
 ```
