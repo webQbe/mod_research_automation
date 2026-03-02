@@ -8,9 +8,14 @@ function onOpen() {
 
 
 function buildAndMergeByMainNiche() {
-  SpreadsheetApp.openById(SPREADSHEET_ID);
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const sheet = ss.getSheetByName('raw_data');
   if (!sheet) { SpreadsheetApp.getUi().alert('Sheet "raw_data" not found.'); return; }
+  
+  // Ensure images are saved to Drive and drive_image_file_id columns are written first
+  saveImagesForSheet();
+  
+  // re-read the sheet now that drive_image_file_id values may exist
   const data = sheet.getDataRange().getValues();
   if (data.length <= 1) { SpreadsheetApp.getUi().alert('No data rows in raw_data.'); return; }
 
@@ -20,7 +25,7 @@ function buildAndMergeByMainNiche() {
 
   const colMain = idx('main_niche');
   const colSub = idx('sub_niche');
-  const colScreenshot = idx('screenshot_id_or_url');
+  const colScreenshot = idx('drive_image_file_id');
   const colLink = idx('product_link');
   const colReviews = idx('review_count');
   const colKeywords = idx('keywords');
@@ -77,6 +82,9 @@ function buildAndMergeByMainNiche() {
       const subDocId = subFile.getId();
       const subDoc = DocumentApp.openById(subDocId);
 
+      // Log to confirm what’s being inserted
+      Logger.log('Items for sub %s: %s', sub, JSON.stringify(items.slice(0,5), null, 2));
+
       // fill subDoc (this function must NOT call saveAndClose)
       fillSubDocFromData(subDoc, main, sub, items);
 
@@ -111,47 +119,6 @@ function buildAndMergeByMainNiche() {
   // SpreadsheetApp.getUi().alert('Done. Created ' + created.length + ' main docs.');
   Logger.log(JSON.stringify(created,null,2));
 }
-
-/**
- * Merge sourceDocId into the provided targetBody.
- * This function opens the source document, iterates its children and appends copies to the targetBody.
- * IMPORTANT: it does NOT save or close the document passed to targetBody (caller should handle saving).
- */
-function mergeDocIntoBody(targetBody, sourceDocId) {
-  const sourceDoc = DocumentApp.openById(sourceDocId);
-  const sourceBody = sourceDoc.getBody();
-  const n = sourceBody.getNumChildren();
-
-  for (let i = 0; i < n; i++) {
-    const child = sourceBody.getChild(i);
-    const type = child.getType();
-
-    try {
-      if (type === DocumentApp.ElementType.PARAGRAPH) {
-        targetBody.appendParagraph(child.asParagraph().copy());
-      } else if (type === DocumentApp.ElementType.TABLE) {
-        targetBody.appendTable(child.asTable().copy());
-      } else if (type === DocumentApp.ElementType.LIST_ITEM) {
-        targetBody.appendListItem(child.asListItem().copy());
-      } else {
-        // fallback: append plain text if unknown type
-        const text = (typeof child.getText === 'function') ? child.getText() : '';
-        targetBody.appendParagraph(text);
-      }
-    } catch (err) {
-      // fallback to text content on failure
-      try {
-        const fallbackText = (typeof child.getText === 'function') ? child.getText() : '';
-        targetBody.appendParagraph(fallbackText);
-      } catch (e2) {
-        Logger.log('Failed to merge child index ' + i + ': ' + e2);
-      }
-    }
-  }
-
-  // don't save/close target doc here; caller will save once after all merges
-}
-
 
 /**
  * Merge all top-level children from sourceDocId into targetDocId (appends to target body).
@@ -197,7 +164,6 @@ function mergeDocInto(targetDocId, sourceDocId) {
   // Save target doc (sourceDoc left as-is)
   targetDoc.saveAndClose();
 }
-
 
 /**
  * Enhanced filler: fills known tokens, removes leftover {{...}} tokens, and cleans empty paragraphs.
@@ -323,6 +289,242 @@ function fillSubDocFromData(subDoc, main, sub, items) {
 }
 
 
+/**
+ * Main wrapper: reads image references from the active spreadsheet (sheet "raw_data")
+ * column "image_url", saves images to folder OUTPUT_FOLDER_ID ('' = My Drive),
+ * and writes back saved file id + url into columns "drive_image_file_id" and "drive_image_url".
+ */
+function saveImagesForSheet() {
+  const SPREADSHEET_ID = '1iA1KF07W6yds3YwxnCAZl25XLTO7iHmluKJGT5OvYak'; // your spreadsheet id (same you used earlier)
+  const SHEET_NAME = 'raw_data';
+  const SOURCE_COL_NAME = 'image_url';
+  const OUT_FILEID_COL = 'drive_image_file_id';
+  // const OUT_FILEURL_COL = 'drive_image_url';
+  const OUTPUT_FOLDER_ID = '1_xWlhf8bjqESX58e7DdqO7mVmMUu3vYC'; // set folder id or '' to use My Drive root
+
+  saveImagesFromSheet({
+    spreadsheetId: SPREADSHEET_ID,
+    sheetName: SHEET_NAME,
+    sourceColHeader: SOURCE_COL_NAME,
+    outFileIdHeader: OUT_FILEID_COL,
+    // outFileUrlHeader: OUT_FILEURL_COL,
+    folderId: OUTPUT_FOLDER_ID,
+    skipIfAlreadySaved: true,   // if true, row with saved_file_id will be skipped
+    delayMs: 300                // delay between requests to avoid throttle
+  });
+}
+
+
+/**
+ * Generic function: reads a given column of a sheet, downloads or copies images and saves them to folder,
+ * and writes back file id and url into two output columns.
+ *
+ * options:
+ *  - spreadsheetId
+ *  - sheetName
+ *  - sourceColHeader
+ *  - outFileIdHeader
+ *  - outFileUrlHeader
+ *  - folderId ('' => root My Drive)
+ *  - skipIfAlreadySaved (default true)
+ *  - delayMs (default 300)
+ */
+function saveImagesFromSheet(options) {
+  const ss = SpreadsheetApp.openById(options.spreadsheetId);
+  const sheet = ss.getSheetByName(options.sheetName);
+  if (!sheet) throw new Error('Sheet not found: ' + options.sheetName);
+
+  const startRow = 2;
+  const delayMs = options.delayMs || 300;
+  const skipIfAlreadySaved = options.skipIfAlreadySaved === undefined ? true : !!options.skipIfAlreadySaved;
+
+  // --- Ensure headers exist and compute indexes ---
+  let headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+  let srcIdx = headers.indexOf(options.sourceColHeader);
+  let outIdIdx = headers.indexOf(options.outFileIdHeader);
+  let outUrlIdx = headers.indexOf(options.outFileUrlHeader);
+
+  // must have source column
+  if (srcIdx === -1) throw new Error('Source column header not found: ' + options.sourceColHeader);
+
+  // append missing out columns (one by one) and then re-read headers
+  let appended = false;
+  if (outIdIdx === -1) {
+    sheet.getRange(1, sheet.getLastColumn() + 1).setValue(options.outFileIdHeader);
+    appended = true;
+  }
+  if (outUrlIdx === -1) {
+    sheet.getRange(1, sheet.getLastColumn() + 1).setValue(options.outFileUrlHeader);
+    appended = true;
+  }
+  if (appended) {
+    // re-read headers and recompute indexes so we have correct column positions
+    headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+    srcIdx = headers.indexOf(options.sourceColHeader);
+    outIdIdx = headers.indexOf(options.outFileIdHeader);
+    outUrlIdx = headers.indexOf(options.outFileUrlHeader);
+  }
+
+  const outIdCol = outIdIdx + 1; // 1-based
+  const outUrlCol = outUrlIdx + 1;
+
+  // --- read data rows ---
+  const lastRow = sheet.getLastRow();
+  if (lastRow < startRow) {
+    Logger.log('No data rows to process.');
+    return;
+  }
+  const data = sheet.getRange(startRow, 1, lastRow - (startRow - 1), sheet.getLastColumn()).getValues();
+
+  const folder = (options.folderId && options.folderId.trim()) ? DriveApp.getFolderById(options.folderId) : DriveApp.getRootFolder();
+  const results = [];
+
+  Logger.log('Processing ' + data.length + ' rows; source col index (0-based)=' + srcIdx + '; outIdCol=' + outIdCol);
+
+  for (let r = 0; r < data.length; r++) {
+    const row = data[r];
+    const sourceVal = String(row[srcIdx] || '').trim();
+    const existingSavedId = String(row[outIdIdx] || '').trim();
+
+    // Skip empty source
+    if (!sourceVal) {
+      results.push([existingSavedId || '', String(row[outUrlIdx] || '') || '']);
+      continue;
+    }
+
+    // Optionally skip if already saved
+    if (skipIfAlreadySaved && existingSavedId) {
+      results.push([existingSavedId, String(row[outUrlIdx] || '') || '']);
+      continue;
+    }
+
+    try {
+      let createdFile = null;
+
+      // strategy: copy drive id, or base64 data uri, or fetch http(s)
+      const driveId = extractDriveFileId(sourceVal);
+      if (driveId) {
+        try {
+          const srcFile = DriveApp.getFileById(driveId);
+          createdFile = srcFile.makeCopy(`${srcFile.getName()} (copy)`, folder);
+        } catch (e) {
+          Logger.log('Drive copy failed for id ' + driveId + ': ' + e);
+        }
+      }
+
+      if (!createdFile && /^data:image\/[a-zA-Z+]+;base64,/.test(sourceVal)) {
+        const matches = sourceVal.match(/^data:(image\/[a-zA-Z+.-]+);base64,(.+)$/);
+        if (matches) {
+          const mime = matches[1];
+          const b64 = matches[2];
+          const blob = Utilities.newBlob(Utilities.base64Decode(b64), mime, `image_row_${r+startRow}.${getExtensionFromMime(mime)}`);
+          createdFile = folder.createFile(blob);
+        }
+      }
+
+      if (!createdFile && /^https?:\/\//i.test(sourceVal)) {
+        try {
+          const resp = UrlFetchApp.fetch(sourceVal, { muteHttpExceptions: true, followRedirects: true });
+          if (resp.getResponseCode && resp.getResponseCode() === 200) {
+            const blob = resp.getBlob();
+            const ext = getExtensionFromMime(blob.getContentType()) || guessExtensionFromUrl(sourceVal) || 'jpg';
+            createdFile = folder.createFile(blob).setName(`image_row_${r+startRow}.${ext}`);
+          } else {
+            Logger.log('Failed fetch (code ' + resp.getResponseCode() + ') for url: ' + sourceVal);
+          }
+        } catch (e) {
+          Logger.log('UrlFetchApp.fetch error for ' + sourceVal + ': ' + e);
+        }
+      }
+
+      if (!createdFile) {
+        Logger.log('Could not create file for row ' + (r + startRow) + ': ' + sourceVal);
+        results.push([existingSavedId || '', String(row[outUrlIdx] || '') || '']);
+      } else {
+        const fid = createdFile.getId();
+        // const furl = createdFile.getUrl ? createdFile.getUrl() : `https://drive.google.com/open?id=${fid}`;
+        // results.push([fid, furl]);
+        results.push([fid]);
+        Logger.log('Saved file for row ' + (r + startRow) + ': ' + fid);
+      }
+    } catch (err) {
+      Logger.log('Unexpected error on row ' + (r + startRow) + ': ' + err);
+      results.push([existingSavedId || '', String(row[outUrlIdx] || '') || '']);
+    }
+
+    Utilities.sleep(delayMs);
+  } // end rows
+
+  // --- write back results (after loop) ---
+  // sanitize shape
+  const sanitized = results.map(r => {
+    if (!Array.isArray(r)) return [String(r || ''), ''];
+    return [String(r[0] || ''), String(r[1] || '')];
+  });
+
+  if (sanitized.length === 0) {
+    Logger.log('No results to write back after processing. Nothing to update.');
+  } else {
+    const lastNeededRow = startRow + sanitized.length - 1;
+    if (sheet.getMaxRows() < lastNeededRow) {
+      sheet.insertRowsAfter(sheet.getMaxRows(), lastNeededRow - sheet.getMaxRows());
+    }
+    // write to the two columns (outIdCol and outUrlCol)
+    const outRange = sheet.getRange(startRow, outIdCol, sanitized.length, 2);
+    outRange.setValues(sanitized);
+    Logger.log('Wrote ' + sanitized.length + ' rows to columns ' + outIdCol + ' and ' + (outIdCol + 1));
+  }
+
+  Logger.log('Image save pass complete. Processed ' + results.length + ' rows.');
+}
+
+
+/**
+ * Extract Drive file id from the common drive url patterns.
+ * returns id string or null
+ */
+function extractDriveFileId(text) {
+  if (!text) return null;
+  // common patterns:
+  // https://drive.google.com/file/d/<id>/view?usp=...
+  // https://drive.google.com/open?id=<id>
+  // plain id (25+ chars of [-_A-Za-z0-9])
+  const fileMatch = text.match(/\/d\/([-\w]{25,})/);
+  if (fileMatch) return fileMatch[1];
+  const idParam = text.match(/[?&]id=([-\w]{25,})/);
+  if (idParam) return idParam[1];
+  // plain id fallback (very permissive — ensure length)
+  const plain = text.match(/^([-\w]{25,})$/);
+  if (plain) return plain[1];
+  return null;
+}
+
+
+/**
+ * Get file extension from mime type (basic map)
+ */
+function getExtensionFromMime(mime) {
+  if (!mime) return '';
+  const m = mime.toLowerCase();
+  if (m.indexOf('jpeg') !== -1 || m.indexOf('jpg') !== -1) return 'jpg';
+  if (m.indexOf('png') !== -1) return 'png';
+  if (m.indexOf('gif') !== -1) return 'gif';
+  if (m.indexOf('bmp') !== -1) return 'bmp';
+  if (m.indexOf('webp') !== -1) return 'webp';
+  if (m.indexOf('tiff') !== -1) return 'tiff';
+  return '';
+}
+
+/**
+ * Try to guess extension from url path
+ */
+function guessExtensionFromUrl(url) {
+  try {
+    const m = url.match(/\.([a-zA-Z0-9]{2,5})(?:$|\?)/);
+    if (m) return m[1].toLowerCase();
+  } catch (e) {}
+  return '';
+}
 
 
 // SpreadsheetApp.getUi().alert('Export complete.');
