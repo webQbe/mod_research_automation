@@ -41,3 +41,42 @@ HEADLESS=0
 SPREADSHEET_ID=google_sheet_id
 SHEET_NAME=raw_data
 ```
+
+#### `data-receiver/` module
+
+`data-receiver/Config.js` file:
+```
+  // ---------- CONFIG ----------
+  const SPREADSHEET_ID = 'google_sheet_id';
+  const SHEET_NAME = 'raw_data';
+  const OUTPUT_FOLDER_NAME = 'scraper_images';
+  const FOLDER_ID = 'drive_folder_id'; // optional
+  const SECRET_TOKEN = 'supersecret123';
+  const MAX_RESULTS_TO_WRITE = 5; // up to N results written to subsequent rows
+
+  const WEBHOOK_VERSION = 'v2.1-20260129';
+
+  // Header A..L
+  const HEADER_ROW = ['id','main_niche','sub_niche''search_term','keywords','status','Error','product_link','price','review_count','captured_at','drive_image_file_id'];
+```
+
+
+`data-receiver/.clasp.json` file:
+```
+{
+  "scriptId": "your_appsscript_id",
+  "rootDir": "",
+  "scriptExtensions": [
+    ".js",
+    ".gs"
+  ],
+  "htmlExtensions": [
+    ".html"
+  ],
+  "jsonExtensions": [
+    ".json"
+  ],
+  "filePushOrder": [],
+  "skipSubdirectories": false
+}
+```
