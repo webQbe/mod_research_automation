@@ -1,0 +1,14 @@
+{
+  "dependencies": {
+    "@google-cloud/local-auth": "^3.0.1",
+    "googleapis": "^170.1.0"
+  },
+  "overrides": {
+    "gtoken": "github:BjornTheProgrammer/node-gtoken"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0",
+    "@types/node": "^25.0.9"
+  },
+  "scripts": {}
+}
