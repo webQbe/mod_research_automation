@@ -1,0 +1,33 @@
+debug-network/
+screenshots/
+
+# credentials
+creds.json
+secrets/
+
+
+# node / python / general
+node_modules/
+venv/
+__pycache__/
+*.pyc
+
+# env / secrets
+.clasp.json
+Config.js
+.env
+.env.local
+*.pem
+*.key
+service-account.json
+*.json # be careful — don't ignore configs you want saved
+
+# infra / state
+.terraform/
+*.tfstate
+*.tfstate.backup
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
