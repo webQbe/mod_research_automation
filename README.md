@@ -4,7 +4,7 @@
 
 #### `doc-exporter/` module
 
-`Config.gs` file:
+`doc-exporter/Config.gs` file:
 ```
 // CONFIG - set these
 const TEMPLATE_ID = 'Doc_template_id';      // <-- put your template ID here
@@ -14,11 +14,12 @@ const SPREADSHEET_ID = 'google_sheet_id';
 ```
 
 
-`.clasp.json` file:
+`doc-exporter/.clasp.json` file:
 ```
 {
   "scriptId": "your_appsscript_id",
   "rootDir": "",
+  "projectId": "merchexport", // Attach GCP project
   "scriptExtensions": [
     ".js",
     ".gs"
@@ -29,7 +30,6 @@ const SPREADSHEET_ID = 'google_sheet_id';
   "jsonExtensions": [
     ".json"
   ],
-  "filePushOrder": [],
-  "skipSubdirectories": false
+  "filePushOrder": []
 }
 ```
