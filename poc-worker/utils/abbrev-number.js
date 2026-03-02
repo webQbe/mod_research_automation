@@ -2,7 +2,6 @@
  * Parse strings like "2.5K", "2K", "1,234", "2,5K", "4.2M", "3B", "123" into an integer.
  * Returns Number (integer) or null if not parseable.
  */
-
 function parseAbbreviatedNumber(s) {
   if (s === null || s === undefined) return null;
   s = String(s).trim();

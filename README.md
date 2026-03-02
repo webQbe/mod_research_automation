@@ -10,9 +10,7 @@
 const TEMPLATE_ID = 'Doc_template_id';      // <-- put your template ID here
 const OUTPUT_FOLDER_ID = ''; // optional: folder to store final main docs (leave '' to put in My Drive)
 const SPREADSHEET_ID = 'google_sheet_id';
-
 ```
-
 
 `doc-exporter/.clasp.json` file:
 ```
@@ -36,11 +34,14 @@ const SPREADSHEET_ID = 'google_sheet_id';
 
 #### `poc-worker/` module
 `poc-worker/.env` file:
-```
-HEADLESS=0
-SPREADSHEET_ID=google_sheet_id
-SHEET_NAME=raw_data
-```
+  ```
+  HEADLESS=0
+  SPREADSHEET_ID=google_sheet_id
+  SHEET_NAME=raw_data
+  PORT=8080
+  WEBHOOK_URL=webhook_appsscript_url
+  WEBHOOK_TOKEN=supersecret123
+  ```
 
 #### `data-receiver/` module
 

@@ -275,7 +275,6 @@ async function handleTopRegionPopup(page) {
   }
 }
 
-
 async function runPlaywrightFor(searchTerm) {
   const browser = await chromium.launch({
     headless: HEADLESS,
@@ -303,7 +302,7 @@ async function runPlaywrightFor(searchTerm) {
 
     console.log('Attempting to Enter US Zip');
 
-     // Wait for the location modal to appear (use the modal xpath that Amazon uses)
+    // Wait for the location modal to appear (use the modal xpath that Amazon uses)
     const modalLocator = page.locator('xpath=/html/body/div[18]');
 
     await modalLocator.waitFor({ timeout: 8000 }).catch( async() => {
@@ -317,9 +316,8 @@ async function runPlaywrightFor(searchTerm) {
       if (await deliver.count() > 0) {
         await removeOverlayIfPresent(page);
         await safeClick(page, deliver, { timeout: 5000 }).catch(()=>{});
-
       }
-        return modalLocator.waitFor({ timeout: 9000 });
+      return modalLocator.waitFor({ timeout: 9000 });
     });
 
     // Now modalLocator should represent the modal; take a scoped screenshot for debugging
@@ -328,7 +326,6 @@ async function runPlaywrightFor(searchTerm) {
       await modalLocator.first().screenshot({ path: scPath }).catch(()=>{});
       console.log('Modal scoped screenshot:', scPath);
     } catch(e){ /* ignore */ }
-
 
     // ---------- Enter ZIP code ----------
     const zipSelectors = [
@@ -346,7 +343,7 @@ async function runPlaywrightFor(searchTerm) {
     }
 
     if (!zipLocator) {
-      console.warn('ZIP input not found; skipping ZIP entry/apply.');
+        console.warn('ZIP input not found; skipping ZIP entry/apply.');
         const stamp = Date.now();
         await page.screenshot({ path: `debug-zip-input-not-opened-${stamp}.png`, fullPage: true }).catch(()=>{});
     } else {
@@ -375,6 +372,7 @@ async function runPlaywrightFor(searchTerm) {
           const stamp = Date.now();
           await page.screenshot({ path: `debug-zip-focus-submit-failed-${stamp}.png`, fullPage: true }).catch(()=>{});
 
+
           // Try 3: submit the form via DOM (if input is inside a form)
           try {
             await page.evaluate(() => {
@@ -386,6 +384,7 @@ async function runPlaywrightFor(searchTerm) {
             console.warn('DOM form.submit() failed (will try clicking apply control)');
             const stamp = Date.now();
             await page.screenshot({ path: `debug-zip-dom-submit-failed-${stamp}.png`, fullPage: true }).catch(()=>{});
+
           }
         }
       }
@@ -424,7 +423,8 @@ async function runPlaywrightFor(searchTerm) {
           } catch (e) { /* ignore */ }
         }
       }
-    } // end zipLocator check
+    } // end zipLocator check  
+
 
     // Try Enter to continue (some flows need another click)
     try {
@@ -454,6 +454,7 @@ async function runPlaywrightFor(searchTerm) {
     await waitForSearchResultsOrTimeout(page, 30000);
     await page.waitForTimeout(800);
 
+   
     // Wait a little for results to reload after sorting/ZIP change
     await sleep(1200);
 
@@ -468,7 +469,13 @@ async function runPlaywrightFor(searchTerm) {
       const scPath = screenshotFilePath({ dir: 'screenshots', prefix: 'results', term: searchTerm });
       await await page.screenshot({ path: scPath }).catch(()=>{});
       console.log('Results screenshot:', scPath);
-    } catch(e){ /* ignore */ }
+      const html = `results-${searchTerm}.html`;
+      const content = await page.content().catch(()=>'<no-html>');
+      require('fs').writeFileSync(html, content);
+      console.warn('Wrote debug results html:', html);
+      } catch (e) { 
+        console.warn('Could not write debug artifacts:', e.message); 
+      }
 
     const scraped = [];
 
@@ -537,7 +544,7 @@ async function runPlaywrightFor(searchTerm) {
 
       scraped.push({
         rank: i + 1,
-        title: title || null,
+        // title: title || null,
         link: link || null,
         image: image || null,
         reviewCount: reviewCountFormatted || null,
