@@ -8,7 +8,7 @@ function onOpen() {
 
 
 function buildAndMergeByMainNiche() {
-  const ss = SpreadsheetApp.getActive();
+  SpreadsheetApp.openById(SPREADSHEET_ID);
   const sheet = ss.getSheetByName('raw_data');
   if (!sheet) { SpreadsheetApp.getUi().alert('Sheet "raw_data" not found.'); return; }
   const data = sheet.getDataRange().getValues();
