@@ -88,18 +88,23 @@ app.post('/run-scrape', async (req, res) => {
           scrapeResult
       };
       
-      const webhookResp = await fetch(WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(webhookPayload)
-      });
-      const text = await webhookResp.text();
-      console.log('Webhook payload keywords (type):', typeof keywordsForWebhook, keywordsForWebhook);
-      console.log('Forwarded to webhook, status:', webhookResp.status);
-      console.log('Webhook body (preview):', text.slice(0,2000));
-      return res.json({ ok: true, forwarded: true, webhookStatus: webhookResp.status, scrapedCount: scrapeResult.length });
-    }
+      try {
+          const webhookResp = await fetch(WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(webhookPayload)
+          });
 
+          const text = await webhookResp.text();
+          console.log('Webhook payload keywords (type):', typeof keywordsForWebhook, keywordsForWebhook);
+          console.log('Forwarded to webhook, status:', webhookResp.status);
+          console.log('Webhook body (preview):', text.slice(0,2000));
+          return res.json({ ok: true, forwarded: true, webhookStatus: webhookResp.status, scrapedCount: scrapeResult.length });
+      } catch(err) {
+          console.error("Webhook forwarding failed:", err.message);
+          console.log("Url:", WEBHOOK_URL);
+      }
+    }
     // otherwise return the scraped result directly
     res.json({ ok: true, forwarded: false, scrapedCount: scrapeResult.length, scrapeResult });
   } catch (err) {
