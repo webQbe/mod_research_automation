@@ -309,6 +309,19 @@ async function runPlaywrightFor(searchTerm) {
       // If modal didn't appear, try a bit longer and retry Deliver-to click once
       console.log('Location modal not detected quickly — retrying Deliver-to click and waiting');
       
+      // Take a page screenshot for debugging > Location modal not detected
+      try {
+        const scPath = screenshotFilePath({ dir: 'screenshots', prefix: 'no-location-modal', term: searchTerm });
+        await await page.screenshot({ path: scPath }).catch(()=>{});
+        console.log('No location modal screenshot:', scPath);
+        const html = `no-location-modal-${searchTerm}.html`;
+        const content = await page.content().catch(()=>'<no-html>');
+        require('fs').writeFileSync(html, content);
+        console.warn('Wrote debug no location modal html:', html);
+        } catch (e) { 
+          console.warn('Could not write "no location modal" debug artifacts:', e.message); 
+        }
+      
       await handleTopRegionPopup(page);
       
       const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
