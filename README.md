@@ -81,3 +81,9 @@ const SPREADSHEET_ID = 'google_sheet_id';
   "skipSubdirectories": false
 }
 ```
+
+#### `react-form/` module
+`react-form/.env` file:
+```
+VITE_SCRAPER_ENDPOINT="http://localhost:8080/api/run-scrape"
+```

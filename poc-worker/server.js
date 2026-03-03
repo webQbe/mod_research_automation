@@ -3,11 +3,19 @@ const express = require('express');
 const fetch = global.fetch || require('node-fetch'); // node <18 fallback
 const { runPlaywrightFor } = require('./amazon-scrape'); // your existing scraper
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || '';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || ''; // optional for forwarding
-const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || 'supersecret123';
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
 
 const app = express();
+
+const cors = require('cors');
+app.use(cors({
+  origin: ['http://localhost:3000'], // list allowed origins
+  methods: ['POST'],
+  allowedHeaders: ['Content-Type']
+}));
+
 
 // use express.json with verify to capture raw body safely
 app.use(express.json({
@@ -38,7 +46,12 @@ app.post('/run-scrape', async (req, res) => {
     console.log('Parsed req.body:', req.body);
 
     const body = req.body || {};
-    const token = body.token || '';
+    const clientToken = body.token || '';
+
+    if (process.env.CLIENT_TOKEN && clientToken !== process.env.CLIENT_TOKEN) {
+      return res.status(401).json({ ok: false, error: 'invalid client token' });
+    }
+
     const main_niche = body.main_niche || body.mainNiche || '';
     const sub_niche = body.sub_niche || body.subNiche || '';
     const keywordsRaw = body.keywords || body.kw || '';
@@ -51,7 +64,7 @@ app.post('/run-scrape', async (req, res) => {
     if (main_niche) parts.push(main_niche);
     if (sub_niche) parts.push(sub_niche);
     parts.push('shirt');
-    const searchTerm = parts.join(' ').replace(/\s+/g, ' ').trim();
+    const searchTerm = parts.join(' ').replace(/\s+/g, ' ').trim().toLowerCase();;
 
     console.log('Built searchTerm:', searchTerm);
 
@@ -59,7 +72,7 @@ app.post('/run-scrape', async (req, res) => {
     const scraped = await runPlaywrightFor(searchTerm);
     const scrapeResult = Array.isArray(scraped) ? scraped : [];
 
-    // optionally forward to webhook (your Apps Script)
+    // forward to webhook (your Apps Script)
     if (WEBHOOK_URL) {
       // ensure keywords is always a plain string for the webhook
       const keywordsForWebhook = Array.isArray(keywords)
