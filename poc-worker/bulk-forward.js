@@ -16,9 +16,7 @@ const PORT = process.env.BULK_PORT || 3001; // Changed from 8080 to 3001
 const WEBHOOK_URL = process.env.WEBHOOK_URL; // Apps Script /exec URL
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || 'supersecret123'; // webhook token expected by Apps Script
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || ''; // token to accept bulk requests from client (optional)
-const CONCURRENCY = Number(process.env.CONCURRENCY || 3); // parallel Playwright runs
-const FORWARD_IMAGE_BASE64 = (process.env.FORWARD_IMAGE_BASE64 || 'true') === 'true';
-const MAX_FORWARDED_IMAGES = Number(process.env.MAX_FORWARDED_IMAGES || 3); // number of top results to include images for
+const CONCURRENCY = Number(process.env.CONCURRENCY || 2); // parallel Playwright runs
 
 // helpers
 function buildSearchTerm(main, sub) {
@@ -72,8 +70,7 @@ async function forwardToWebhook(payload, attempt = 0) {
         if (data.summary && Array.isArray(data.summary)) {
           console.log(`${taskId}   - Summary: ${data.summary.length} items`);
           data.summary.forEach((item, idx) => {
-            console.log(`${taskId}     [${idx + 1}] reviews=${item.reviewCount || 'N/A'}, price=${item.price || 'N/A'}, fileId=${item.fileId ? 'YES' : 'NO'}`);
-          });
+              console.log(`${taskId}     [${idx + 1}] Screenshot=${item.fileId ? 'Saved' : 'No image'}`);          });
         }
       } else {
         console.warn(`${taskId} ⚠️ Apps Script returned ok=false`);

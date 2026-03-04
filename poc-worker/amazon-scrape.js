@@ -2,19 +2,9 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const { parseAbbreviatedNumber, formatWithCommas } = require('./utils/abbrev-number');
 const { screenshotFilePath } = require('./fileHelper');
-const path = require('path');
 
-
-const HEADLESS = process.env.HEADLESS !== '0'; // set HEADLESS=0 to see the browser
-const ZIP = '10022';
 const MAX_RESULTS = 5;
 const AMAZON_BASE = 'https://www.amazon.com';
-
-const DEFAULT_USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-];
 
 function randChoice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
@@ -150,75 +140,6 @@ function extractNumberFromText(s) {
         const cleaned = s.replace(/[^\d,]/g, '').replace(/,/g, '');
         const n = parseInt(cleaned, 10);
         return Number.isNaN(n) ? null : n;
-}
-
-
-async function safeGotoWith503Handling(page, url, opts = {}) {
-  /*  
-    * - retries navigation up to maxAttempts
-    * - first tries waitUntil 'domcontentloaded', then 'load'
-    * - logs response status if available
-    * - on final failure saves screenshot and page HTML for debugging
-  */
-  const maxAttempts = opts.maxAttempts || 3;
-  const baseTimeout = opts.baseTimeout || 30000; // 30s default
-  const screenshotDir = opts.screenshotDir || path.join(process.cwd(), 'debug-screens');
-  if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir, { recursive: true });
-
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const timeout = Math.min(120000, baseTimeout * Math.pow(1.8, attempt-1)); // increasing timeout
-    try {
-      // console.log(`safeGoto attempt ${attempt} -> ${url}`);
-      
-      // try lightweight 'domcontentloaded' first (faster, often enough)
-      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
-      if (response) {
-        const status = response.status();
-        console.log(`safeGoto attempt ${attempt} -> response status: ${status}`);
-      } else {
-        console.log(`safeGoto attempt ${attempt} -> no response object`);
-      }
-      // optionally wait for main content selector (reduce false positives)
-      try {
-        await page.waitForSelector('div.s-main-slot, #search, main', { timeout: 5000 });
-      } catch (err) {
-        // not fatal — continue; we'll decide by response or content
-      }
-    // if we got here, treat as success
-      return response || null;
-
-    } catch (err) {
-      console.warn(`safeGoto attempt ${attempt} failed: ${err.message}`);
-      
-      // small random backoff before next try
-      await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random()*1200)));
-
-      // final attempt fallback: try with waitUntil 'load'
-      if (attempt === maxAttempts) {
-        try {
-          console.log('Final attempt: trying waitUntil "load" with longer timeout...');
-          const response2 = await page.goto(url, { waitUntil: 'load', timeout: Math.min(120000, baseTimeout * 2) });
-          return response2 || null;
-        } catch (err2) {
-          // capture artifacts for debugging
-          const safeName = `failed-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-          const pngPath = path.join(screenshotDir, `${safeName}.png`);
-          const htmlPath = path.join(screenshotDir, `${safeName}.html`);
-          try {
-            await page.screenshot({ path: pngPath, fullPage: true });
-            const html = await page.content();
-            fs.writeFileSync(htmlPath, html);
-            console.error(`Navigation finally failed. Saved screenshot: ${pngPath} and HTML: ${htmlPath}`);
-          } catch (saveErr) {
-            console.error('Failed to save debug artifacts:', saveErr);
-          }
-          throw err2; // rethrow so upstream can handle/log
-        }
-    }
-  }
-  return null;
-} 
 }
 
 // remove known overlays or disable pointer events on them
@@ -400,35 +321,6 @@ async function handleTopRegionPopup(page) {
     console.warn('[popup] handleTopRegionPopup error:', err.message || err);
     return false;
   }
-}
-
-// Call this after you've opened the modal and want to ensure it is closed via the "Continue" button.
-// Relies on safeClick(page, locator) and removeOverlayIfPresent(page) helpers already in your script.
-
-async function waitForModalClosed(page, opts = {}) {
-  const timeout = opts.timeout ?? 10000;
-  const start = Date.now();
-  const poll = opts.pollInterval ?? 300;
-
-  // modal locators to consider "modal is open"
-  const modalLocator = page.locator('div[role="dialog"], .a-popover, div[id^="a-popover"], .a-modal');
-
-  while (Date.now() - start < timeout) {
-    try {
-      const count = await modalLocator.count();
-      let anyVisible = false;
-      for (let i = 0; i < count; i++) {
-        try {
-          if (await modalLocator.nth(i).isVisible()) { anyVisible = true; break; }
-        } catch (e) { /* ignore per-item errors */ }
-      }
-      if (!anyVisible) return true; // no visible modals -> closed
-    } catch (e) {
-      // if locator query fails, sleep and try again
-    }
-    await page.waitForTimeout(poll);
-  }
-  return false; // timed out while modal still appears visible
 }
 
 // Enhanced modal close helper: call after modal appears
