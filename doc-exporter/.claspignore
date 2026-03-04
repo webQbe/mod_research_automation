@@ -1,0 +1,20 @@
+cloud-project/
+tests/
+.vscode/
+README.md
+
+# from your repo root
+cat > .claspignore <<'EOF'
+# dev / test / build
+node_modules/
+.vscode/
+dist/
+*.test.js
+*.spec.js
+
+# Playwright and other local configs
+playwright.config.js
+playwright.config.ts
+playwright.config.* 
+cloud-project/playwright.config.*
+EOF

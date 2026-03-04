@@ -11,6 +11,9 @@ function buildAndMergeByMainNiche() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const sheet = ss.getSheetByName('raw_data');
   if (!sheet) { SpreadsheetApp.getUi().alert('Sheet "raw_data" not found.'); return; }
+
+  // Fill down main+sub until next non-empty
+  fillMainSub_fillDown(sheet);
   
   // Ensure images are saved to Drive and drive_image_file_id columns are written first
   saveImagesForSheet();
@@ -118,6 +121,46 @@ function buildAndMergeByMainNiche() {
 
   // SpreadsheetApp.getUi().alert('Done. Created ' + created.length + ' main docs.');
   Logger.log(JSON.stringify(created,null,2));
+}
+
+function fillMainSub_fillDown(sheet) {
+  const lastCol = sheet.getLastColumn();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h).trim());
+  const cMain = headers.indexOf('main_niche');
+  const cSub  = headers.indexOf('sub_niche');
+  if (cMain === -1 || cSub === -1) {
+    Logger.log('Headers main_niche or sub_niche not found.');
+    return;
+  }
+
+  const dataRange = sheet.getRange(2, 1, lastRow - 1, lastCol);
+  const data = dataRange.getValues();
+
+  let lastMain = '';
+  let lastSub = '';
+
+  for (let i = 0; i < data.length; i++) {
+    const curMain = String(data[i][cMain] || '').trim();
+    const curSub  = String(data[i][cSub]  || '').trim();
+
+    if (curMain) {
+      lastMain = curMain;
+    } else if (lastMain) {
+      data[i][cMain] = lastMain;
+    }
+
+    if (curSub) {
+      lastSub = curSub;
+    } else if (lastSub) {
+      data[i][cSub] = lastSub;
+    }
+  }
+
+  dataRange.setValues(data);
+  Logger.log('Filled down main_niche/sub_niche for all blank rows.');
 }
 
 /**
