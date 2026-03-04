@@ -8,18 +8,15 @@ function onOpen() {
 
 
 function buildAndMergeByMainNiche() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName('raw_data');
-  if (!sheet) { SpreadsheetApp.getUi().alert('Sheet "raw_data" not found.'); return; }
-
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const sheetName = ss.getSheetByName('raw_data');
+  if (!sheetName) { SpreadsheetApp.getUi().alert('Sheet "raw_data" not found.'); return; }
+  
   // Fill down main+sub until next non-empty
-  fillMainSub_fillDown_withGeneral(sheet);
-  
-  // Ensure images are saved to Drive and drive_image_file_id columns are written first
-  saveImagesForSheet();
-  
+  fillMainSub_fillDown_withGeneral(sheetName);
+
   // re-read the sheet now that drive_image_file_id values may exist
-  const data = sheet.getDataRange().getValues();
+  const data = sheetName.getDataRange().getValues();
   if (data.length <= 1) { SpreadsheetApp.getUi().alert('No data rows in raw_data.'); return; }
 
   const header = data[0].map(h=>String(h).trim());
@@ -56,9 +53,9 @@ function buildAndMergeByMainNiche() {
     const docName = `Research — ${main} (${new Date().toISOString().slice(0,10)})`;
 
     // Create mainDoc as a copy of the template so header/footer/styles remain
-    const mainCopyFile = DriveApp.getFileById(TEMPLATE_ID).makeCopy(docName);
-    if (OUTPUT_FOLDER_ID) {
-      DriveApp.getFolderById(OUTPUT_FOLDER_ID).addFile(mainCopyFile);
+    const mainCopyFile = DriveApp.getFileById(docTemplateId).makeCopy(docName);
+    if (outputFolderId) {
+      DriveApp.getFolderById(outputFolderId).addFile(mainCopyFile);
       DriveApp.getRootFolder().removeFile(mainCopyFile);
     }
     const mainDocId = mainCopyFile.getId();
@@ -81,7 +78,7 @@ function buildAndMergeByMainNiche() {
 
       // create temp sub-doc (copy of template)
       const subCopyName = `TEMP - ${main} / ${sub} (${new Date().toISOString().slice(0,10)})`;
-      const subFile = DriveApp.getFileById(TEMPLATE_ID).makeCopy(subCopyName);
+      const subFile = DriveApp.getFileById(docTemplateId).makeCopy(subCopyName);
       const subDocId = subFile.getId();
       const subDoc = DocumentApp.openById(subDocId);
 
@@ -121,30 +118,519 @@ function buildAndMergeByMainNiche() {
 
   // SpreadsheetApp.getUi().alert('Done. Created ' + created.length + ' main docs.');
   Logger.log(JSON.stringify(created,null,2));
+
+  // Prepare entries for merge helper: convert {main, url} -> {main, docId}
+  const entries = created.map(c => ({ main: c.main, docId: c.url }));
+
+  // GENERATE BATCH NUMBER 
+  const dateStr = new Date().toISOString().slice(0,10);
+  let batchNumber = 1;
+  
+  // Check for existing "Combined – Batch" files today in the output folder
+  if (outputFolderId && outputFolderId.trim()) {
+    try {
+      const folder = DriveApp.getFolderById(outputFolderId);
+      const files = folder.getFiles();
+      const pattern = new RegExp(`^Combined – Batch (\\d+) – ${dateStr.replace(/[-]/g, '\\-')}$`);
+      
+      while (files.hasNext()) {
+        const file = files.next();
+        const match = file.getName().match(pattern);
+        if (match) {
+          const num = parseInt(match[1], 10);
+          if (num >= batchNumber) {
+            batchNumber = num + 1;
+          }
+        }
+      }
+    } catch (e) {
+      Logger.log('Could not check existing batch files: ' + e);
+    }
+  }
+
+  // MERGE 10 MAIN-NICHES INTO ONE COMBINED DOC
+  // Define name for combined doc
+  const combinedName = `Combined – Batch ${String(batchNumber).padStart(2, '0')} – ${dateStr}`;
+  Logger.log('Combined doc name: ' + combinedName);
+
+  try {
+    const res = mergeMainDocsAndWriteSheet_WithFolderAndCleanup(
+                    entries, 
+                    combinedName, 
+                    spreadsheetId, // combined doc url is written to the same sheet
+                    'raw_data',  // ← Changed from sheetName to 'raw_data'
+                    outputFolderId, 
+                    'main_niche', 
+                    'doc_url' 
+                );
+    Logger.log('mergeMainDocsAndWriteSheet result: ' + JSON.stringify(res));
+  
+    // CREATE MASTER INDEX AFTER SUCCESSFUL MERGE 
+    // Build entries array for master index
+    const masterEntries = [{
+      title: combinedName,
+      url: res.combinedDocUrl,
+      mains: created.map(c => ({
+        name: c.main,
+        subNiches: Object.keys(groups[c.main]) // get all sub-niches for this main
+      }))
+    }];
+
+    // Create the master index document
+    const masterResult = createMasterIndexDoc(
+      masterEntries, 
+      outputFolderId, 
+      `Master Index — ${new Date().toISOString().slice(0,10)}`,
+      { makePageless: true, deleteOldWithSameTitle: true }
+    );
+    
+    Logger.log('Master index created!' /* : ' + JSON.stringify(masterResult) */);
+    SpreadsheetApp.getUi().alert('Export complete!' /* Master index created at: ' + masterResult.masterDocUrl */);            
+  
+  } catch (e) {
+    Logger.log('Failed to merge and write combined doc: ' + e);
+  }
+
 }
 
 /**
+ * Create a Master Index doc from combinedFiles entries.
+ *
+ * @param {Array} entries - array of { title, url, mains: [{name, subNiches: []}, ...] }
+ * @param {string} outputFolderId - Drive folder id to store master index ('' => My Drive root)
+ * @param {string} masterTitle - Title for the master index doc (optional)
+ * @param {Object} [opts] - optional flags: { makePageless: true/false, deleteOldWithSameTitle: true/false }
+ * @returns {Object} { masterDocId, masterDocUrl }
+ *
+ * NOTE: To programmatically set pageless mode, enable the Docs Advanced Service (Docs) and the Google Docs API.
+ */
+function createMasterIndexDoc(entries, outputFolderId = '', masterTitle = '', opts = {}) {
+  if (!Array.isArray(entries) || entries.length === 0) throw new Error('entries must be a non-empty array');
+
+  opts = Object.assign({ makePageless: true, deleteOldWithSameTitle: false }, opts);
+
+  // Normalize
+  const normalized = entries.map(e => ({
+    title: (e.title || e.name || '').toString().trim(),
+    url:   (e.url || e.docUrl || e.docId || '').toString().trim(),
+    mains: Array.isArray(e.mains) ? e.mains.slice(0, 10).map(m => ({
+      name: (m.name || m.main || '').toString().trim(),
+      subNiches: Array.isArray(m.subNiches) ? m.subNiches.map(String).map(s=>s.trim()).filter(Boolean) : []
+    })) : []
+  })).filter(e => e.title && e.url);
+
+  if (normalized.length === 0) throw new Error('No valid normalized entries found.');
+
+  // Optional: delete existing master with same title (safer to test false first)
+  const safeTitle = masterTitle || ('Master Index — ' + (new Date()).toISOString().slice(0,10));
+  if (opts.deleteOldWithSameTitle && outputFolderId && outputFolderId.trim()) {
+    try {
+      const folder = DriveApp.getFolderById(outputFolderId);
+      const files = folder.getFilesByName(safeTitle);
+      while (files.hasNext()) {
+        const f = files.next();
+        f.setTrashed(true);
+        Logger.log('Trashed previous master file: ' + f.getId());
+      }
+    } catch (e) {
+      Logger.log('Could not delete existing master file(s): ' + e);
+    }
+  }
+
+  // Create new doc
+  const masterDocFile = DocumentApp.create(safeTitle);
+  const masterDocId = masterDocFile.getId();
+  const masterDoc = DocumentApp.openById(masterDocId);
+  const body = masterDoc.getBody();
+
+  // Header: last updated date
+  const nowStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+  body.appendParagraph('Last updated: ' + nowStr).setHeading(DocumentApp.ParagraphHeading.HEADING3);
+  body.appendParagraph(''); // spacer
+
+  body.appendParagraph('Master Index').setHeading(DocumentApp.ParagraphHeading.TITLE);
+  body.appendParagraph(''); // spacer
+
+  body.appendParagraph('Niches in each doc').setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  body.appendParagraph(''); // spacer
+
+  // For each combined file, append a subsection: linked title + table of mains & sub-niches
+  normalized.forEach((entry, entryIdx) => {
+    // Section title with clickable link
+    const titlePara = body.appendParagraph(entry.title); 
+    try {
+      // attach link to the title text
+      // 1. Set the heading style FIRST
+      titlePara.setHeading(DocumentApp.ParagraphHeading.HEADING2);
+      // 2. Then apply specific text formatting
+      const titleText = titlePara.editAsText();
+      titleText.setText(entry.title);
+      titleText.setLinkUrl(entry.url);
+      titleText.setForegroundColor('#0000FF'); // blue color
+    } catch (e) {
+      Logger.log('Could not set link for title: ' + e);
+    }
+
+    // Build table rows (header + mains)
+    const tableRows = [];
+    tableRows.push(['Main-niches', 'Sub-niches']); // make bold
+
+    for (let i = 0; i < entry.mains.length; i++) {
+      const mn = entry.mains[i];
+      const idxLabel = (i + 1) + '. ' + (mn.name || '');
+      const subs = (mn.subNiches && mn.subNiches.length) ? mn.subNiches.join(', ') : ''; // blank allowed
+      tableRows.push([idxLabel, subs]);
+    }
+
+    // Append table only if there are mains; otherwise insert a small placeholder
+    if (tableRows.length > 1) {
+      const table = body.appendTable(tableRows);
+      
+      // Make header row (first row) bold
+      try {
+        const headerRow = table.getRow(0);
+        headerRow.getCell(0).editAsText().setBold(true);
+        headerRow.getCell(1).editAsText().setBold(true);
+      } catch (e) {
+        Logger.log('Could not bold table headers: ' + e);
+      }
+    } else {
+      body.appendParagraph('No main-niches in this combined doc.');
+    }
+
+    // Blank line after each section
+    body.appendParagraph('');
+  });
+
+  masterDoc.saveAndClose();
+
+  // Move master file into outputFolderId if provided
+  try {
+    if (outputFolderId && outputFolderId.trim()) {
+      const masterDriveFile = DriveApp.getFileById(masterDocId);
+      const folder = DriveApp.getFolderById(outputFolderId);
+      folder.addFile(masterDriveFile);
+      DriveApp.getRootFolder().removeFile(masterDriveFile);
+      Logger.log('Moved master index to folder: ' + outputFolderId);
+    } else {
+      Logger.log('No outputFolderId provided — master left in My Drive root.');
+    }
+  } catch (e) {
+    Logger.log('Error moving master file to folder: ' + e);
+  }
+
+  // Try to set pageless (Docs Advanced Service required)
+  if (opts.makePageless) {
+    try {
+      if (typeof Docs !== 'undefined' && Docs.Documents && Docs.Documents.batchUpdate) {
+        const requests = [{
+          updateDocumentStyle: {
+            documentStyle: {
+              documentFormat: {
+                documentMode: 'PAGELESS'
+              }
+            },
+            fields: 'documentFormat.documentMode'
+          }
+        }];
+        Docs.Documents.batchUpdate({ requests }, masterDocId);
+        Logger.log('Requested pageless mode for master doc.');
+      } else {
+        Logger.log('Docs Advanced Service not available; pageless not set. Enable Docs service to set pageless.');
+      }
+    } catch (e) {
+      Logger.log('Pageless request failed: ' + e);
+    }
+  }
+
+  const masterUrl = DriveApp.getFileById(masterDocId).getUrl();
+  Logger.log('Master index created: ' + masterUrl);
+  return { masterDocId, masterDocUrl: masterUrl };
+}
+
+/**
+ * Merge main docs into one combined doc created inside outputFolderId (if provided),
+ * set the combined doc to pageless (if Docs Advanced Service is enabled),
+ * trash the source docs (entries) after successful creation,
+ * and write the combined doc URL into the sheet's doc_url column for matching main_niche rows.
+ *
+ * entries: [{ main: 'Fitness', docId: 'https://docs.google.com/document/d/ID/...' }, ...]
+ * outputFolderId: Drive folder id where combined doc will be placed ('' => root)
+ *
+ * Returns { combinedDocId, combinedDocUrl, rowsUpdated, trashedCount }.
+ */
+function mergeMainDocsAndWriteSheet_WithFolderAndCleanup(entries, combinedName, spreadsheetId, sheetName, outputFolderId, mainColHeader = 'main_niche', docUrlHeader = 'doc_url') {
+  if (!Array.isArray(entries) || entries.length === 0) throw new Error('entries must be a non-empty array');
+
+  // helper: extract docId from url or id
+  function extractDocIdFromDocUrl(u) {
+    if (!u) return null;
+    const m1 = u.match(/\/d\/([-\w]{10,})/);
+    if (m1) return m1[1];
+    const m2 = u.match(/[?&]id=([-\w]{10,})/);
+    if (m2) return m2[1];
+    const m3 = u.match(/docs\.google\.com\/document\/d\/([-\w]{10,})/);
+    if (m3) return m3[1];
+    const plain = u.match(/^([-\w]{10,})$/);
+    if (plain) return plain[1];
+    return null;
+  }
+
+  // normalize entries -> { main, docId }
+  const normalized = entries.map(e => {
+    const main = (e.main || e.name || '').toString().trim();
+    const idOrUrl = (e.docId || e.id || e.url || e.link || '').toString().trim();
+    const docId = extractDocIdFromDocUrl(idOrUrl) || idOrUrl;
+    return { main, docId };
+  }).filter(x => x.main && x.docId);
+
+  if (normalized.length === 0) throw new Error('No valid entries with both main and docId provided.');
+
+  // --- Create combined document (in Drive root first) ---
+  const combinedFile = DocumentApp.create(combinedName || ('Combined ' + new Date().toISOString()));
+  const combinedDocId = combinedFile.getId();
+  const combinedDoc = DocumentApp.openById(combinedDocId);
+  const combinedBody = combinedDoc.getBody();
+
+  // Add a simple title page and page break
+  combinedBody.appendParagraph('Combined Research').setHeading(DocumentApp.ParagraphHeading.TITLE);
+  combinedBody.appendParagraph('Created: ' + new Date().toISOString());
+  combinedBody.appendPageBreak();
+
+  // Helper to append children from a source doc
+  function appendDocChildrenToTargetBody(targetBody, sourceDocId) {
+    try {
+      const sourceDoc = DocumentApp.openById(sourceDocId);
+      const sourceBody = sourceDoc.getBody();
+      const n = sourceBody.getNumChildren();
+      for (let i = 0; i < n; i++) {
+        const child = sourceBody.getChild(i);
+        const type = child.getType();
+        try {
+          if (type === DocumentApp.ElementType.PARAGRAPH) {
+            targetBody.appendParagraph(child.asParagraph().copy());
+          } else if (type === DocumentApp.ElementType.TABLE) {
+            targetBody.appendTable(child.asTable().copy());
+          } else if (type === DocumentApp.ElementType.LIST_ITEM) {
+            targetBody.appendListItem(child.asListItem().copy());
+          } else {
+            // fallback: append plain text
+            const text = (typeof child.getText === 'function') ? child.getText() : '';
+            targetBody.appendParagraph(text);
+          }
+        } catch (err) {
+          try {
+            const fallbackText = (typeof child.getText === 'function') ? child.getText() : '';
+            targetBody.appendParagraph(fallbackText);
+          } catch (e2) {
+            Logger.log('Failed to append child: ' + e2);
+          }
+        }
+      }
+    } catch (e) {
+      Logger.log('Failed to open source doc ' + sourceDocId + ': ' + e);
+    }
+  }
+
+  // Append each source doc
+  normalized.forEach((entry, idx) => {
+    combinedBody.appendParagraph(`Main niche: ${entry.main}`).setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    appendDocChildrenToTargetBody(combinedBody, entry.docId);
+    if (idx < normalized.length - 1) combinedBody.appendPageBreak();
+  });
+
+  combinedDoc.saveAndClose();
+
+  // --- Move combined file into OUTPUT_FOLDER_ID if provided ---
+  try {
+    const combinedDriveFile = DriveApp.getFileById(combinedDocId);
+    if (outputFolderId && outputFolderId.toString().trim()) {
+      const targetFolder = DriveApp.getFolderById(outputFolderId);
+      targetFolder.addFile(combinedDriveFile);
+      DriveApp.getRootFolder().removeFile(combinedDriveFile);
+      Logger.log('Moved combined doc to folder: ' + outputFolderId);
+    } else {
+      Logger.log('No outputFolderId provided; combined doc left in My Drive root.');
+    }
+  } catch (e) {
+    Logger.log('Failed to move combined doc to folder ' + outputFolderId + ': ' + e);
+  }
+
+  // --- Try to set the combined doc to pageless using the Docs API (Advanced Service) ---
+  let pagelessSet = false;
+  try {
+    if (typeof Docs !== 'undefined' && Docs.Documents && Docs.Documents.batchUpdate) {
+      const requests = [
+        {
+          updateDocumentStyle: {
+            documentStyle: {
+              // DocumentFormat is a nested object; set document_mode to PAGELESS
+              documentFormat: {
+                documentMode: 'PAGELESS'
+              }
+            },
+            fields: 'documentFormat.documentMode'
+          }
+        }
+      ];
+      Docs.Documents.batchUpdate({ requests: requests }, combinedDocId);
+      pagelessSet = true;
+      Logger.log('Requested pageless mode via Docs API.');
+    } else {
+      Logger.log('Docs Advanced Service not available. Skipping pageless request. Enable the Docs advanced service to set pageless programmatically.');
+    }
+  } catch (e) {
+    Logger.log('Attempt to set pageless via Docs API failed: ' + e);
+  }
+
+  // --- Trash (delete) the source docs (normalized entries) ---
+  let trashedCount = 0;
+  normalized.forEach(entry => {
+    try {
+      const f = DriveApp.getFileById(entry.docId);
+      // Avoid trashing the combined doc itself if by chance it was included
+      if (f && f.getId() !== combinedDocId) {
+        f.setTrashed(true);
+        trashedCount++;
+      }
+    } catch (e) {
+      Logger.log('Failed to trash source doc ' + entry.docId + ': ' + e);
+    }
+  });
+  Logger.log('Trashed ' + trashedCount + ' source docs.');
+
+  const combinedFileUrl = DriveApp.getFileById(combinedDocId).getUrl();
+
+  // --- Write combined URL into spreadsheet doc_url column for matching mains ---
+  const mainsSet = {};
+  normalized.forEach(e => { if (e.main) mainsSet[e.main] = true; });
+
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) throw new Error('Sheet not found: ' + sheetName);
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h || '').trim());
+  const mainIdx = headers.findIndex(h => h.toLowerCase().replace(/[_\s]+/g,'') === mainColHeader.toLowerCase().replace(/[_\s]+/g,''));
+  if (mainIdx === -1) throw new Error('Could not find main_niche column header: ' + mainColHeader);
+
+  let docUrlIdx = headers.indexOf(docUrlHeader);
+  if (docUrlIdx === -1) {
+    // append header if missing
+    const newCol = sheet.getLastColumn() + 1;
+    sheet.getRange(1, newCol).setValue(docUrlHeader);
+    docUrlIdx = newCol - 1;
+  }
+
+  const startRow = 2;
+  const lastRow = sheet.getLastRow();
+  const data = sheet.getRange(startRow, 1, Math.max(0, lastRow - 1), sheet.getLastColumn()).getValues();
+
+  const updates = [];
+  let updatedCount = 0;
+
+  for (let r = 0; r < data.length; r++) {
+    const row = data[r];
+    const mainVal = String(row[mainIdx] || '').trim();
+    if (mainVal && mainsSet[mainVal]) {
+      updates.push([combinedFileUrl]);
+      updatedCount++;
+    } else {
+      updates.push([String(row[docUrlIdx] || '') || '']);
+    }
+  }
+
+  // Ensure enough rows/columns
+  const outCol = docUrlIdx + 1;
+  if (sheet.getMaxRows() < startRow + updates.length - 1) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), startRow + updates.length - 1 - sheet.getMaxRows());
+  }
+  sheet.getRange(startRow, outCol, updates.length, 1).setValues(updates);
+
+  Logger.log('Wrote combined doc url to ' + updatedCount + ' rows in sheet ' + sheetName);
+
+  return {
+    combinedDocId: combinedDocId,
+    combinedDocUrl: combinedFileUrl,
+    rowsUpdated: updatedCount,
+    trashedCount: trashedCount,
+    pagelessRequested: pagelessSet
+  };
+}
+
+/**
+ * Extract Drive file id from the common drive url patterns.
+ * returns id string or null
+ */
+function extractDriveFileId(text) {
+  if (!text) return null;
+
+  // common patterns:
+  // https://drive.google.com/file/d/<id>/view?usp=...
+  // https://drive.google.com/open?id=<id>
+  // plain id (25+ chars of [-_A-Za-z0-9])
+
+  const fileMatch = text.match(/\/d\/([-\w]{25,})/);
+  if (fileMatch) return fileMatch[1];
+
+  const idParam = text.match(/[?&]id=([-\w]{25,})/);
+  if (idParam) return idParam[1];
+
+  // plain id fallback (very permissive — ensure length)
+  const plain = text.match(/^([-\w]{25,})$/);
+  if (plain) return plain[1];
+
+  return null;
+}
+
+/**
+ * Try to guess extension from url path
+ */
+function guessExtensionFromUrl(url) {
+  try {
+    const m = url.match(/\.([a-zA-Z0-9]{2,5})(?:$|\?)/);
+    if (m) return m[1].toLowerCase();
+  } catch (e) {}
+  return '';
+}
+
+/**
+ * Get file extension from mime type (basic map)
+ */
+function getExtensionFromMime(mime) {
+  if (!mime) return '';
+  const m = mime.toLowerCase();
+  if (m.indexOf('jpeg') !== -1 || m.indexOf('jpg') !== -1) return 'jpg';
+  if (m.indexOf('png') !== -1) return 'png';
+  if (m.indexOf('gif') !== -1) return 'gif';
+  if (m.indexOf('bmp') !== -1) return 'bmp';
+  if (m.indexOf('webp') !== -1) return 'webp';
+  if (m.indexOf('tiff') !== -1) return 'tiff';
+  return '';
+}
+
+function fillMainSub_fillDown_withGeneral(sheetName) {
+    /**
    * Fill down main_niche and sub_niche, but first set sub_niche = "General"
    * for any row that has a main_niche but an empty sub_niche.
    *
    * Call this BEFORE you build `rows`. After calling, re-read the sheet data.
-*/
-function fillMainSub_fillDown_withGeneral(sheet) {
-  const lastCol = sheet.getLastColumn();
-  const lastRow = sheet.getLastRow();
+   */
+  const lastCol = sheetName.getLastColumn();
+  const lastRow = sheetName.getLastRow();
   if (lastRow < 2) return;
 
   // tolerant header lookup
-  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || '').trim());
+  const headers = sheetName.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || '').trim());
   const norm = s => String(s || '').trim().toLowerCase().replace(/[_\s]+/g, '');
   const cMain = headers.findIndex(h => norm(h) === 'mainniche' || norm(h) === 'main_niche' || norm(h) === 'main');
   const cSub  = headers.findIndex(h => norm(h) === 'subniche'  || norm(h) === 'sub_niche'  || norm(h) === 'sub');
+
   if (cMain === -1 || cSub === -1) {
-      Logger.log('Headers main_niche or sub_niche not found. Aborting fill-down.');
-      return;
+    Logger.log('Headers main_niche or sub_niche not found. Aborting fill-down.');
+    return;
   }
 
-  const dataRange = sheet.getRange(2, 1, lastRow - 1, lastCol);
+  const dataRange = sheetName.getRange(2, 1, lastRow - 1, lastCol);
   const data = dataRange.getValues();
 
   // Step 1: where main exists but sub is blank, set sub = "General"
@@ -178,9 +664,50 @@ function fillMainSub_fillDown_withGeneral(sheet) {
       data[i][cSub] = lastSub;
     }
   }
+
   // write back once
   dataRange.setValues(data);
   Logger.log('Filled main_niche/sub_niche with General for main rows missing sub, then filled down.');
+}
+
+/*
+ * Merge sourceDocId into the provided targetBody.
+ * This function opens the source document, iterates its children and appends copies to the targetBody.
+ * IMPORTANT: it does NOT save or close the document passed to targetBody (caller should handle saving).
+ */
+function mergeDocIntoBody(targetBody, sourceDocId) {
+  const sourceDoc = DocumentApp.openById(sourceDocId);
+  const sourceBody = sourceDoc.getBody();
+  const n = sourceBody.getNumChildren();
+
+  for (let i = 0; i < n; i++) {
+    const child = sourceBody.getChild(i);
+    const type = child.getType();
+
+    try {
+      if (type === DocumentApp.ElementType.PARAGRAPH) {
+        targetBody.appendParagraph(child.asParagraph().copy());
+      } else if (type === DocumentApp.ElementType.TABLE) {
+        targetBody.appendTable(child.asTable().copy());
+      } else if (type === DocumentApp.ElementType.LIST_ITEM) {
+        targetBody.appendListItem(child.asListItem().copy());
+      } else {
+        // fallback: append plain text if unknown type
+        const text = (typeof child.getText === 'function') ? child.getText() : '';
+        targetBody.appendParagraph(text);
+      }
+    } catch (err) {
+      // fallback to text content on failure
+      try {
+        const fallbackText = (typeof child.getText === 'function') ? child.getText() : '';
+        targetBody.appendParagraph(fallbackText);
+      } catch (e2) {
+        Logger.log('Failed to merge child index ' + i + ': ' + e2);
+      }
+    }
+  }
+
+  // don't save/close target doc here; caller will save once after all merges
 }
 
 /**
@@ -227,6 +754,7 @@ function mergeDocInto(targetDocId, sourceDocId) {
   // Save target doc (sourceDoc left as-is)
   targetDoc.saveAndClose();
 }
+
 
 /**
  * Enhanced filler: fills known tokens, removes leftover {{...}} tokens, and cleans empty paragraphs.
@@ -350,244 +878,5 @@ function fillSubDocFromData(subDoc, main, sub, items) {
 
   // NOTE: do NOT call subDoc.saveAndClose() here; caller will handle that
 }
-
-
-/**
- * Main wrapper: reads image references from the active spreadsheet (sheet "raw_data")
- * column "image_url", saves images to folder OUTPUT_FOLDER_ID ('' = My Drive),
- * and writes back saved file id + url into columns "drive_image_file_id" and "drive_image_url".
- */
-function saveImagesForSheet() {
-  const SPREADSHEET_ID = '1iA1KF07W6yds3YwxnCAZl25XLTO7iHmluKJGT5OvYak'; // your spreadsheet id (same you used earlier)
-  const SHEET_NAME = 'raw_data';
-  const SOURCE_COL_NAME = 'image_url';
-  const OUT_FILEID_COL = 'drive_image_file_id';
-  // const OUT_FILEURL_COL = 'drive_image_url';
-  const OUTPUT_FOLDER_ID = '1_xWlhf8bjqESX58e7DdqO7mVmMUu3vYC'; // set folder id or '' to use My Drive root
-
-  saveImagesFromSheet({
-    spreadsheetId: SPREADSHEET_ID,
-    sheetName: SHEET_NAME,
-    sourceColHeader: SOURCE_COL_NAME,
-    outFileIdHeader: OUT_FILEID_COL,
-    // outFileUrlHeader: OUT_FILEURL_COL,
-    folderId: OUTPUT_FOLDER_ID,
-    skipIfAlreadySaved: true,   // if true, row with saved_file_id will be skipped
-    delayMs: 300                // delay between requests to avoid throttle
-  });
-}
-
-
-/**
- * Generic function: reads a given column of a sheet, downloads or copies images and saves them to folder,
- * and writes back file id and url into two output columns.
- *
- * options:
- *  - spreadsheetId
- *  - sheetName
- *  - sourceColHeader
- *  - outFileIdHeader
- *  - outFileUrlHeader
- *  - folderId ('' => root My Drive)
- *  - skipIfAlreadySaved (default true)
- *  - delayMs (default 300)
- */
-function saveImagesFromSheet(options) {
-  const ss = SpreadsheetApp.openById(options.spreadsheetId);
-  const sheet = ss.getSheetByName(options.sheetName);
-  if (!sheet) throw new Error('Sheet not found: ' + options.sheetName);
-
-  const startRow = 2;
-  const delayMs = options.delayMs || 300;
-  const skipIfAlreadySaved = options.skipIfAlreadySaved === undefined ? true : !!options.skipIfAlreadySaved;
-
-  // --- Ensure headers exist and compute indexes ---
-  let headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
-  let srcIdx = headers.indexOf(options.sourceColHeader);
-  let outIdIdx = headers.indexOf(options.outFileIdHeader);
-  let outUrlIdx = headers.indexOf(options.outFileUrlHeader);
-
-  // must have source column
-  if (srcIdx === -1) throw new Error('Source column header not found: ' + options.sourceColHeader);
-
-  // append missing out columns (one by one) and then re-read headers
-  let appended = false;
-  if (outIdIdx === -1) {
-    sheet.getRange(1, sheet.getLastColumn() + 1).setValue(options.outFileIdHeader);
-    appended = true;
-  }
-  if (outUrlIdx === -1) {
-    sheet.getRange(1, sheet.getLastColumn() + 1).setValue(options.outFileUrlHeader);
-    appended = true;
-  }
-  if (appended) {
-    // re-read headers and recompute indexes so we have correct column positions
-    headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
-    srcIdx = headers.indexOf(options.sourceColHeader);
-    outIdIdx = headers.indexOf(options.outFileIdHeader);
-    outUrlIdx = headers.indexOf(options.outFileUrlHeader);
-  }
-
-  const outIdCol = outIdIdx + 1; // 1-based
-  const outUrlCol = outUrlIdx + 1;
-
-  // --- read data rows ---
-  const lastRow = sheet.getLastRow();
-  if (lastRow < startRow) {
-    Logger.log('No data rows to process.');
-    return;
-  }
-  const data = sheet.getRange(startRow, 1, lastRow - (startRow - 1), sheet.getLastColumn()).getValues();
-
-  const folder = (options.folderId && options.folderId.trim()) ? DriveApp.getFolderById(options.folderId) : DriveApp.getRootFolder();
-  const results = [];
-
-  Logger.log('Processing ' + data.length + ' rows; source col index (0-based)=' + srcIdx + '; outIdCol=' + outIdCol);
-
-  for (let r = 0; r < data.length; r++) {
-    const row = data[r];
-    const sourceVal = String(row[srcIdx] || '').trim();
-    const existingSavedId = String(row[outIdIdx] || '').trim();
-
-    // Skip empty source
-    if (!sourceVal) {
-      results.push([existingSavedId || '', String(row[outUrlIdx] || '') || '']);
-      continue;
-    }
-
-    // Optionally skip if already saved
-    if (skipIfAlreadySaved && existingSavedId) {
-      results.push([existingSavedId, String(row[outUrlIdx] || '') || '']);
-      continue;
-    }
-
-    try {
-      let createdFile = null;
-
-      // strategy: copy drive id, or base64 data uri, or fetch http(s)
-      const driveId = extractDriveFileId(sourceVal);
-      if (driveId) {
-        try {
-          const srcFile = DriveApp.getFileById(driveId);
-          createdFile = srcFile.makeCopy(`${srcFile.getName()} (copy)`, folder);
-        } catch (e) {
-          Logger.log('Drive copy failed for id ' + driveId + ': ' + e);
-        }
-      }
-
-      if (!createdFile && /^data:image\/[a-zA-Z+]+;base64,/.test(sourceVal)) {
-        const matches = sourceVal.match(/^data:(image\/[a-zA-Z+.-]+);base64,(.+)$/);
-        if (matches) {
-          const mime = matches[1];
-          const b64 = matches[2];
-          const blob = Utilities.newBlob(Utilities.base64Decode(b64), mime, `image_row_${r+startRow}.${getExtensionFromMime(mime)}`);
-          createdFile = folder.createFile(blob);
-        }
-      }
-
-      if (!createdFile && /^https?:\/\//i.test(sourceVal)) {
-        try {
-          const resp = UrlFetchApp.fetch(sourceVal, { muteHttpExceptions: true, followRedirects: true });
-          if (resp.getResponseCode && resp.getResponseCode() === 200) {
-            const blob = resp.getBlob();
-            const ext = getExtensionFromMime(blob.getContentType()) || guessExtensionFromUrl(sourceVal) || 'jpg';
-            createdFile = folder.createFile(blob).setName(`image_row_${r+startRow}.${ext}`);
-          } else {
-            Logger.log('Failed fetch (code ' + resp.getResponseCode() + ') for url: ' + sourceVal);
-          }
-        } catch (e) {
-          Logger.log('UrlFetchApp.fetch error for ' + sourceVal + ': ' + e);
-        }
-      }
-
-      if (!createdFile) {
-        Logger.log('Could not create file for row ' + (r + startRow) + ': ' + sourceVal);
-        results.push([existingSavedId || '', String(row[outUrlIdx] || '') || '']);
-      } else {
-        const fid = createdFile.getId();
-        // const furl = createdFile.getUrl ? createdFile.getUrl() : `https://drive.google.com/open?id=${fid}`;
-        // results.push([fid, furl]);
-        results.push([fid]);
-        Logger.log('Saved file for row ' + (r + startRow) + ': ' + fid);
-      }
-    } catch (err) {
-      Logger.log('Unexpected error on row ' + (r + startRow) + ': ' + err);
-      results.push([existingSavedId || '', String(row[outUrlIdx] || '') || '']);
-    }
-
-    Utilities.sleep(delayMs);
-  } // end rows
-
-  // --- write back results (after loop) ---
-  // sanitize shape
-  const sanitized = results.map(r => {
-    if (!Array.isArray(r)) return [String(r || ''), ''];
-    return [String(r[0] || ''), String(r[1] || '')];
-  });
-
-  if (sanitized.length === 0) {
-    Logger.log('No results to write back after processing. Nothing to update.');
-  } else {
-    const lastNeededRow = startRow + sanitized.length - 1;
-    if (sheet.getMaxRows() < lastNeededRow) {
-      sheet.insertRowsAfter(sheet.getMaxRows(), lastNeededRow - sheet.getMaxRows());
-    }
-    // write to the two columns (outIdCol and outUrlCol)
-    const outRange = sheet.getRange(startRow, outIdCol, sanitized.length, 2);
-    outRange.setValues(sanitized);
-    Logger.log('Wrote ' + sanitized.length + ' rows to columns ' + outIdCol + ' and ' + (outIdCol + 1));
-  }
-
-  Logger.log('Image save pass complete. Processed ' + results.length + ' rows.');
-}
-
-
-/**
- * Extract Drive file id from the common drive url patterns.
- * returns id string or null
- */
-function extractDriveFileId(text) {
-  if (!text) return null;
-  // common patterns:
-  // https://drive.google.com/file/d/<id>/view?usp=...
-  // https://drive.google.com/open?id=<id>
-  // plain id (25+ chars of [-_A-Za-z0-9])
-  const fileMatch = text.match(/\/d\/([-\w]{25,})/);
-  if (fileMatch) return fileMatch[1];
-  const idParam = text.match(/[?&]id=([-\w]{25,})/);
-  if (idParam) return idParam[1];
-  // plain id fallback (very permissive — ensure length)
-  const plain = text.match(/^([-\w]{25,})$/);
-  if (plain) return plain[1];
-  return null;
-}
-
-
-/**
- * Get file extension from mime type (basic map)
- */
-function getExtensionFromMime(mime) {
-  if (!mime) return '';
-  const m = mime.toLowerCase();
-  if (m.indexOf('jpeg') !== -1 || m.indexOf('jpg') !== -1) return 'jpg';
-  if (m.indexOf('png') !== -1) return 'png';
-  if (m.indexOf('gif') !== -1) return 'gif';
-  if (m.indexOf('bmp') !== -1) return 'bmp';
-  if (m.indexOf('webp') !== -1) return 'webp';
-  if (m.indexOf('tiff') !== -1) return 'tiff';
-  return '';
-}
-
-/**
- * Try to guess extension from url path
- */
-function guessExtensionFromUrl(url) {
-  try {
-    const m = url.match(/\.([a-zA-Z0-9]{2,5})(?:$|\?)/);
-    if (m) return m[1].toLowerCase();
-  } catch (e) {}
-  return '';
-}
-
 
 // SpreadsheetApp.getUi().alert('Export complete.');
