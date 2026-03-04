@@ -1,8 +1,10 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
+const path = require('path');
 const { parseAbbreviatedNumber, formatWithCommas } = require('./utils/abbrev-number');
 const { screenshotFilePath } = require('./fileHelper');
 const logger = require('./logger');
+const { dedupeResults } = require('./dedupe-by-image'); // adjust path as needed
 
 const MAX_RESULTS = 5;
 const AMAZON_BASE = 'https://www.amazon.com';
@@ -578,6 +580,71 @@ async function zipVerify(page){
   // ==================== END ZIP VERIFICATION LOOP ====================
 }
 
+/**
+ * safeGoto(page, url, opts)
+ * - retries navigation up to maxAttempts
+ * - first tries waitUntil 'domcontentloaded', then 'load'
+ * - logs response status if available
+ * - on final failure saves screenshot and page HTML for debugging
+ */
+async function safeGoto(page, url, opts = {}) {
+  const maxAttempts = opts.maxAttempts || 3;
+  const baseTimeout = opts.baseTimeout || 30000; // 30s default
+  const screenshotDir = opts.screenshotDir || path.join(process.cwd(), 'debug-screens');
+  if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir, { recursive: true });
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const timeout = Math.min(120000, baseTimeout * Math.pow(1.8, attempt-1)); // increasing timeout
+    try {
+      // try lightweight 'domcontentloaded' first (faster, often enough)
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+      if (response) {
+        const status = response.status();
+        console.log(`safeGoto attempt ${attempt} -> response status: ${status}`);
+      } else {
+        console.log(`safeGoto attempt ${attempt} -> no response object`);
+      }
+
+      // optionally wait for main content selector (reduce false positives)
+      try {
+        await page.waitForSelector('div.s-main-slot, #search, main', { timeout: 5000 });
+      } catch (err) {
+        // not fatal — continue; we'll decide by response or content
+      }
+
+      // if we got here, treat as success
+      return response || null;
+    } catch (err) {
+      console.warn(`safeGoto attempt ${attempt} failed (timeout or navigation error): ${err.message}`);
+      // small random backoff before next try
+      await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random()*1200)));
+      // final attempt fallback: try with waitUntil 'load'
+      if (attempt === maxAttempts) {
+        try {
+          console.log('Final attempt: trying waitUntil "load" with longer timeout...');
+          const response2 = await page.goto(url, { waitUntil: 'load', timeout: Math.min(120000, baseTimeout * 2) });
+          return response2 || null;
+        } catch (err2) {
+          // capture artifacts for debugging
+          const safeName = `failed-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+          const pngPath = path.join(screenshotDir, `${safeName}.png`);
+          const htmlPath = path.join(screenshotDir, `${safeName}.html`);
+          try {
+            await page.screenshot({ path: pngPath, fullPage: true });
+            const html = await page.content();
+            fs.writeFileSync(htmlPath, html);
+            console.error(`Navigation finally failed. Saved screenshot: ${pngPath} and HTML: ${htmlPath}`);
+          } catch (saveErr) {
+            console.error('Failed to save debug artifacts:', saveErr);
+          }
+          throw err2; // rethrow so upstream can handle/log
+        }
+      }
+    }
+  }
+  return null;
+}
+
 
 async function runPlaywrightFor(searchTerm,  opts = {}) {
   const externallyProvidedPage = !!opts.page;
@@ -603,10 +670,19 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
   const taskId = opts.taskId ?? 'local';
   logger.log(`[${taskId}] runPlaywrightFor start:`, searchTerm);
 
+  const maxResults = Number(opts.maxResults || 10);
+  const targetUniqueCount = Number(opts.targetUniqueCount || 5);
+
+  if (!page) {
+    throw new Error('runPlaywrightFor requires opts.page (a Playwright Page).');
+  }
 
   try {
     // strictly use the local `page` variable only
     const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&i=fashion-novelty&rh=n%3A9103696011%2Cp_6%3AATVPDKIKX0DER&s=relevancerank&dc&qid=1770902095&rnid=2661622011&ref=sr_nr_p_6_1&ds=v1%3AlWj3BQdPmGzUzm8rpSf5mBoXxUpp28tJW2GjPrv9h3M`;
+
+    console.log(`[${taskId}] runPlaywrightFor start: "${searchTerm}" maxResults=${maxResults} targetUnique=${targetUniqueCount}`);
+
     // Before navigation set headers on the page
     await page.setExtraHTTPHeaders({
       'accept-language': 'en-US,en;q=0.9'
@@ -614,18 +690,19 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     page.setDefaultNavigationTimeout(60000); // 60s
     page.setDefaultTimeout(45000);
 
-    // strictly use the local `page` variable only
-    const response = await page.goto(searchUrl);
-    logger.info('Navigating to searchUrl' /* :', searchUrl */);
+    logger.info(`[${taskId}] Navigating to searchUrl` /* :', searchUrl */);
     
-    if (!response) {
-      logger.log(`[${taskId}] safeGoto returned null (no response) for ${searchTerm}`);
+    // safe goto (uses retries + artifact capture on failure)
+    const navResp = await safeGoto(page, searchUrl, { maxAttempts: 3, baseTimeout: 30000 });
+    if (!navResp) {
+      console.warn(`[${taskId}] page.goto returned no response; returning empty results`);
       return [];
     }
+    
     // Check HTTP status if response available
-    const resStatus = response.status ? response.status() : null;
+    const resStatus = navResp.status ? navResp.status() : null;
     if (resStatus && resStatus >= 400) {
-      logger.log(`[${taskId}] navigation returned status ${status} for ${url}`);
+      logger.log(`[${taskId}] navigation returned status ${resStatus} for ${url}`);
       // decide whether to continue or return empty
       return [];
     }
@@ -638,9 +715,9 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     await modalLocator.waitFor({ timeout: 8000 }).catch( async() => {
       // If modal didn't appear, try a bit longer and retry Deliver-to click once
       logger.info('Location modal not detected quickly — retrying Deliver-to click and waiting');
-
+      
       await handleTopRegionPopup(page);
-
+      
       const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
       const deliver = page.locator(`xpath=${deliverToXpath}`);
       if (await deliver.count() > 0) {
@@ -736,6 +813,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
             try { fs.writeFileSync(`debug-change-address-fail-${stamp}.html`, await page.content()); } catch(e){}
             console.warn('Error handling Change Address (saved debug). Error:', err.message);
           }
+
           if (!zipHandled) {
             logger.info('No ZIP input found (modal may require sign-in or be different). Skipping ZIP step.');
           }
@@ -774,9 +852,10 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     await waitForSearchResultsOrTimeout(page, 30000);
     await page.waitForTimeout(800);
 
-    
+   
     // Wait a little for results to reload after sorting/ZIP change
     await sleep(1200);
+
 
     // ---------- Scrape top N organic search results ----------
     const resultsLocator = page.locator('div[data-component-type="s-search-result"]');
@@ -787,7 +866,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     // Take a page screenshot of loaded results for debugging
     try {
       const scPath = screenshotFilePath({ dir: 'screenshots', prefix: 'results', term: searchTerm });
-      await await page.screenshot({ path: scPath }).catch(()=>{});
+      await page.screenshot({ path: scPath }).catch(()=>{});
       console.log('Results screenshot:', scPath);
       const html = `results-${searchTerm}.html`;
       const content = await page.content().catch(()=>'<no-html>');
@@ -797,11 +876,17 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
         console.warn('Could not write debug artifacts:', e.message); 
       }
 
-    const scraped = [];
-    const seenLinks = new Set(); // Track unique product links
+    // Extract up to `maxResults` items from the first page using Playwright locators (NOT $$eval with async code)
+    const scrapedResults = [];
+    const resultItems = page.locator('div.s-main-slot > div.s-result-item');
+    const itemCount = await resultItems.count();
 
-    for (let i = 0; i < available; i++) {
-      const r = resultsLocator.nth(i);
+    for (let i = 0; i < itemCount && scrapedResults.length < maxResults; i++) {
+      const r = resultItems.nth(i);
+
+      // Check for ASIN
+      const asin = await r.getAttribute('data-asin').catch(() => null);
+      if (!asin) continue;
 
       // Title
       const title = await trySelectorsText(r, [
@@ -813,13 +898,6 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
       let link = await trySelectorsAttr(r, ['h2 a', 'a.a-link-normal.s-no-outline'], 'href');
       if (link && link.startsWith('/')) link = AMAZON_BASE + link;
       if (link && !link.startsWith('http')) link = AMAZON_BASE + '/' + link;
-
-      // Skip duplicates based on link
-      if (link && seenLinks.has(link)) {
-        logger.info(`Skipping duplicate product at position ${i + 1}: ${link}`);
-        continue;
-      }
-      if (link) seenLinks.add(link);
 
       // Image
       let image = await trySelectorsAttr(r, ['img.s-image', 'img'], 'src');
@@ -859,7 +937,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
           reviewCountFormatted = null;
         }
       }
-      // console.log(`[${i + 1}] rawReviewCount: (${rawReviewCount}) ->`, reviewCountValue, reviewCountFormatted);    
+          
       // Price
       const price = await trySelectorsText(r, [
         'span.a-price > span.a-offscreen',
@@ -867,21 +945,34 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
         'span.a-color-price',
       ]);
 
-      scraped.push({
-        rank: i + 1,
-        // title: title || null,
-        link: link || null,
-        image: image || null,
-        reviewCount: reviewCountFormatted || null,
-        price: price || null,
+      scrapedResults.push({
+          asin: asin || '',
+          title,
+          link,
+          image,
+          price,
+          reviewCountFormatted,
+          rank: scrapedResults.length + 1,
+          capturedAt: new Date().toISOString()
       });
     }
-    logger.log(`[${taskId}] scraped ${scraped.length} unique items for`, searchTerm);
-    return scraped;
+
+   console.log(`[${taskId}] scraped ${scrapedResults.length} items from first page`);
+
+  // Dedupe by image similarity
+  const { unique } = await dedupeResults(scrapedResults, { concurrency: 6, threshold: 3, keep: 'first' });
+  console.log(`[${taskId}] after deduplication: total scraped=${scrapedResults.length}, uniqueImages=${unique.length}`);
+
+  // Return up to targetUniqueCount unique results
+  const finalResults = unique.slice(0, targetUniqueCount);
+  console.log(`[${taskId}] returning ${finalResults.length} unique results (target was ${targetUniqueCount})`);
+  return finalResults;
+
   } catch (err) {
-    logger.log(`[${taskId}] scrape error for ${searchTerm}:`, err);
+    console.error(`[${taskId}] runPlaywrightFor fatal error:`, err && err.stack ? err.stack : err);
     return [];
-  } finally {
+  }
+  finally {
     // close only what we created
     if (!externallyProvidedPage) {
       try { await context.close(); } catch (e) {}
