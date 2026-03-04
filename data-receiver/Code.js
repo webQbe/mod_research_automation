@@ -1,5 +1,17 @@
 // ---------- doPost ----------
 function doPost(e){
+  // Acquire lock (blocks other requests)
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);  // Wait up to 30 seconds for lock
+  } catch (lockErr) {
+    Logger.log('Lock timeout: ' + lockErr);
+    return jsonOut({ 
+      ok: false, 
+      error: 'Server busy, please retry',
+      details: 'Could not acquire lock - too many concurrent requests'
+    }, 503);
+  }
   try {
     if (!e || !e.postData || !e.postData.contents) return jsonOut({ ok:false, error:'No POST body' }, 400);
     const payload = JSON.parse(e.postData.contents || '{}');
@@ -24,17 +36,20 @@ function doPost(e){
     const parentRow = [ id, mainNiche, subNiche, searchTerm, keywords, '', '' ];
     sheet.appendRow(parentRow);
     const sheetRow = sheet.getLastRow();
+    Logger.log('Acquired row ' + sheetRow + ' for search: ' + searchTerm);
 
     // Prepare results block: write to rows sheetRow .. sheetRow + max - 1
     const scrapedArr = Array.isArray(payload.scrapeResult) ? payload.scrapeResult : (Array.isArray(payload.results) ? payload.results : []);
-    const maxToWrite = Math.min(MAX_RESULTS_TO_WRITE, scrapedArr.length || 0);
+    Logger.log('Received results count: ' + scrapedArr.length);
+    Logger.log('Results data: ' + JSON.stringify(scrapedArr));
 
     // Build rows for H..L (5 columns per result)
     const rowsToWrite = [];
     const statusUpdates = []; // for column F
     const nowIso = new Date().toISOString();
+    const maxToWrite = Math.min(MAX_RESULTS_TO_WRITE, scrapedArr.length);
 
-    for (let i = 0; i < MAX_RESULTS_TO_WRITE; i++) {
+    for (let i = 0; i < maxToWrite; i++) {
       const r = scrapedArr[i] || {};
       const link = r.link || '';
       const price = r.price || '';
@@ -67,7 +82,7 @@ function doPost(e){
 
     // If rowsToWrite length < MAX_RESULTS_TO_WRITE, pad with empty rows so block is rectangular
     while (rowsToWrite.length < MAX_RESULTS_TO_WRITE) {
-      rowsToWrite.push(['', '','', '','', '']);
+      rowsToWrite.push(['', '', '', '', '']);
       statusUpdates.push({
         range: `${SHEET_NAME}!F${sheetRow + rowsToWrite.length - 1}`,
         values: [[ 'no-result' ]]
@@ -112,8 +127,14 @@ function doPost(e){
       summary: rowsToWrite.map((r, idx) => ({ rank: idx+1, link: r[0] || null, fileId: r[4] || null }))
     }, 200);
 
-  } catch (err) {
-    return jsonOut({ ok:false, error: String(err), stack: err && err.stack ? err.stack : '' }, 500);
+  } finally {
+      try {
+        lock.releaseLock();
+        Logger.log('Lock released');
+      } catch (e) {
+        Logger.log('Failed to release lock: ' + e);
+        // Lock will auto-release after 30 seconds
+      }
   }
 } 
 
