@@ -48,12 +48,11 @@ function doPost(e){
     const statusUpdates = []; // for column F
     const nowIso = new Date().toISOString();
     const maxToWrite = Math.min(MAX_RESULTS_TO_WRITE, scrapedArr.length);
-
     for (let i = 0; i < maxToWrite; i++) {
       const r = scrapedArr[i] || {};
       const link = r.link || '';
       const price = r.price || '';
-      const reviewCount = (r.reviewCount !== undefined && r.reviewCount !== null) ? String(r.reviewCount) : '';
+      const reviewCount = (r.reviewCount !== undefined && r.reviewCount !== null && r.reviewCount < 1000000000) ? String(r.reviewCount) : '';
       const capturedAt = r.capturedAt || nowIso;
 
       let fileId = '';
