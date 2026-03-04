@@ -18,37 +18,33 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL; // Apps Script /exec URL
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || 'supersecret123'; // webhook token expected by Apps Script
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || ''; // token to accept bulk requests from client (optional)
 const CONCURRENCY = Number(process.env.CONCURRENCY || 2); // parallel Playwright runs
+const ROTATING_SUFFIXES = ['shirt', 'life', 'day', 'design'];
 
-// helpers
-function buildSearchTerm(main, sub) {
+
+function buildSearchTerm(main, sub, idx = 0) {
+  /**
+   * buildSearchTerm(main, sub, idx)
+   * - picks a rotating suffix from ROTATING_SUFFIXES based on idx
+   * - returns string like: "Fitness Running shirt" or "Fitness Animal life vintage"
+  */
+  const suffix = ROTATING_SUFFIXES[ (Math.max(0, Number(idx)) % ROTATING_SUFFIXES.length) ];
   const parts = [];
-  if (main) parts.push(main.trim());
-  if (sub) parts.push(sub.trim());
-  parts.push('shirt');
+  if (main) parts.push(String(main).trim());
+  if (sub) parts.push(String(sub).trim());
+  // suffix rotates per input index
+  parts.push(suffix);
   return parts.filter(Boolean).join(' ').replace(/\s+/g, ' ');
 }
 
 async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-// fetch image bytes and return base64 string (or null)
-async function fetchImageAsBase64(url) {
-  if (!url) return null;
-  try {
-    const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
-    const buf = Buffer.from(resp.data);
-    return buf.toString('base64');
-  } catch (err) {
-    console.warn('fetchImageAsBase64 failed for', url, err && err.message);
-    return null;
-  }
-}
 
 // forward payload to webhook with retries and backoff
 async function forwardToWebhook(payload, attempt = 0) {
   const MAX_ATTEMPTS = 5;
   const taskId = payload.clientId !== undefined ? `[${payload.clientId}]` : '';
   try {
-    logger.log(`${taskId} Forwarding to webhook (attempt ${attempt + 1}/${MAX_ATTEMPTS})...`);    console.log(`${taskId} Payload summary: search="${payload.search_term}", results=${Array.isArray(payload.scrapeResult) ? payload.scrapeResult.length : 0}`);
+    logger.log(`${taskId} Forwarding to webhook (attempt ${attempt + 1}/${MAX_ATTEMPTS})...`);
+    console.log(`${taskId} Payload summary: search="${payload.search_term}", results=${Array.isArray(payload.scrapeResult) ? payload.scrapeResult.length : 0}`);
     const resp = await axios.post(WEBHOOK_URL, payload, { headers: {'Content-Type':'application/json'}, timeout: 120000 });
     // return { ok:true, status: resp.status, data: resp.data };
     const status = resp.status;
@@ -69,7 +65,8 @@ async function forwardToWebhook(payload, attempt = 0) {
         if (data.summary && Array.isArray(data.summary)) {
           console.log(`${taskId}   - Summary: ${data.summary.length} items`);
           data.summary.forEach((item, idx) => {
-              console.log(`${taskId}     [${idx + 1}] Screenshot=${item.fileId ? 'Saved' : 'No image'}`);          });
+            console.log(`${taskId}     [${idx + 1}] Screenshot=${item.fileId ? 'Saved' : 'No image'}`);
+          });
         }
       } else {
         logger.log(`${taskId} ⚠️ Apps Script returned ok=false`);
@@ -143,12 +140,12 @@ app.post('/api/run-bulk', async (req, res) => {
       const tasks = niches.map((n, idx) => limit(async () => {
         const main = n.main_niche || n.main || '';
         const sub = n.sub_niche || n.sub || '';
-        const keywords = n.keywords || n.key || '';
-        const searchTerm = buildSearchTerm(main, sub, keywords);
-        // console.log(`Processing niche[${idx}]:`, { searchTerm });
+
+        // pass idx so suffix rotates predictably across the whole list
+        const searchTerm = buildSearchTerm(main, sub, idx);     
 
         console.log(`\n[${idx}] ${'─'.repeat(50)}`);
-        logger.info(`[${idx}] Processing: "${searchTerm}"`);
+        logger.info(`Processing search[${idx}]:`, { searchTerm });
         console.log(`[${idx}] Main: "${main}", Sub: "${sub}"`);
 
 
