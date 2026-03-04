@@ -606,7 +606,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
 
   try {
     // strictly use the local `page` variable only
-    const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&i=fashion&rh=n%3A7141123011%2Cn%3A7147445011%2Cn%3A12035955011%2Cn%3A9103696011%2Cp_6%3AATVPDKIKX0DER&s=exact-aware-popularity-rank&dc&crid=32KWX5YSMPKFS&qid=1769802877&rnid=12035955011&sprefix=${encodeURIComponent(searchTerm)}%2Cfashion%2C1382&ref=sr_st_exact-aware-popularity-rank&ds=v1%3Aj3gHDOxV25aXkkzkP3BVzm%2FKIALNeMjnRSV99ITAu1E`;
+    const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&i=fashion-novelty&rh=n%3A9103696011%2Cp_6%3AATVPDKIKX0DER&s=relevancerank&dc&qid=1770902095&rnid=2661622011&ref=sr_nr_p_6_1&ds=v1%3AlWj3BQdPmGzUzm8rpSf5mBoXxUpp28tJW2GjPrv9h3M`;
     // Before navigation set headers on the page
     await page.setExtraHTTPHeaders({
       'accept-language': 'en-US,en;q=0.9'
@@ -666,9 +666,11 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
             const changeAddressBtn = page.locator('.a-spacing-top-base:has-text("Change Address")');
 
             if (await changeAddressBtn.count() > 0) {
-              logger.info('Found "Change Address" button; attempting to click it...');              const clicked = await safeClick(page, changeAddressBtn, { timeout: 10000 });
+              logger.info('Found "Change Address" button; attempting to click it...');
+              const clicked = await safeClick(page, changeAddressBtn, { timeout: 10000 });
               if (!clicked) {
-                logger.info('safeClick failed on Change Address; trying force-click and DOM click fallback...');                try { await changeAddressBtn.first().click({ force: true, timeout: 5000 }); } catch (e) {}
+                logger.info('safeClick failed on Change Address; trying force-click and DOM click fallback...');
+                try { await changeAddressBtn.first().click({ force: true, timeout: 5000 }); } catch (e) {}
                 try { await page.evaluate(() => {
                   const el = Array.from(document.querySelectorAll('.a-spacing-top-base')).find(n => n && n.textContent && n.textContent.includes('Change Address'));
                   if (el) el.click();
@@ -688,7 +690,8 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
               const zipResult2 = await findZipInputAcrossFrames(page);
 
               if (zipResult2 && zipResult2.locator) {
-                logger.info('ZIP input found after clicking Change Address — filling and submitting...');                const { locator } = zipResult2;
+                logger.info('ZIP input found after clicking Change Address — filling and submitting...');
+                const { locator } = zipResult2;
                 try {
                   await locator.fill('10022');
                 } catch (e) { logger.info('Failed to fill ZIP:', e.message); }
@@ -701,29 +704,31 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
                     await locator.focus();
                     await page.keyboard.press('Enter');
                   } catch (e2) {
-                     logger.info('Enter press fallbacks failed; will attempt Apply click fallback.');                  }
+                    logger.info('Enter press fallbacks failed; will attempt Apply click fallback.');
+                  }
                 }
 
                 // after opening modal and short wait:
                 await page.waitForTimeout(600);
                 const ok = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
                 if (!ok) {
-                  logger.info('Could not close modal via Continue — skipping ZIP and proceeding to scrape (or abort).');                
+                  logger.info('Could not close modal via Continue — skipping ZIP and proceeding to scrape (or abort).');
                 } else {
                   logger.info('Modal closed successfully after ZIP submission');
                   zipHandled = true;
                   await page.waitForTimeout(300);
                 }
-                 // Wait briefly for search results to appear
+
+                // Wait briefly for search results to appear
                 await waitForSearchResultsOrTimeout(page, 8000);
                 logger.info('ZIP submit attempted; continue with scraping.');
                 // Verify zip is set, after modal closed and before scraping
                 await zipVerify(page);
               } else {
-               logger.info('Still no ZIP input after clicking Change Address. Skipping ZIP step (modal may require sign-in).');
+                logger.info('Still no ZIP input after clicking Change Address. Skipping ZIP step (modal may require sign-in).');
               }
             } else {
-                logger.info('"Change Address" button not found in modal; skipping that step.');            
+              logger.info('"Change Address" button not found in modal; skipping that step.');
             }
           } catch (err) {
             const stamp = Date.now();
@@ -757,7 +762,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
             logger.info('ZIP submission failed:', e.message);
           }
         }
-        } catch(e){ 
+    } catch(e){ 
       logger.info('Modal handling error:', e.message);
     }
 
@@ -769,7 +774,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     await waitForSearchResultsOrTimeout(page, 30000);
     await page.waitForTimeout(800);
 
-
+    
     // Wait a little for results to reload after sorting/ZIP change
     await sleep(1200);
 
@@ -854,8 +859,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
           reviewCountFormatted = null;
         }
       }
-      // console.log(`[${i + 1}] rawReviewCount: (${rawReviewCount}) ->`, reviewCountValue, reviewCountFormatted);
-
+      // console.log(`[${i + 1}] rawReviewCount: (${rawReviewCount}) ->`, reviewCountValue, reviewCountFormatted);    
       // Price
       const price = await trySelectorsText(r, [
         'span.a-price > span.a-offscreen',
