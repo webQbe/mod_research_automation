@@ -2,6 +2,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const { parseAbbreviatedNumber, formatWithCommas } = require('./utils/abbrev-number');
 const { screenshotFilePath } = require('./fileHelper');
+const logger = require('./logger');
 
 const MAX_RESULTS = 5;
 const AMAZON_BASE = 'https://www.amazon.com';
@@ -600,7 +601,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
   }
 
   const taskId = opts.taskId ?? 'local';
-  console.log(`[${taskId}] runPlaywrightFor start:`, searchTerm);
+  logger.log(`[${taskId}] runPlaywrightFor start:`, searchTerm);
 
 
   try {
@@ -615,28 +616,28 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
 
     // strictly use the local `page` variable only
     const response = await page.goto(searchUrl);
-    console.log('Navigating to searchUrl' /* :', searchUrl */);
+    logger.info('Navigating to searchUrl' /* :', searchUrl */);
     
     if (!response) {
-      console.warn(`[${taskId}] safeGoto returned null (no response) for ${searchTerm}`);
+      logger.log(`[${taskId}] safeGoto returned null (no response) for ${searchTerm}`);
       return [];
     }
     // Check HTTP status if response available
     const resStatus = response.status ? response.status() : null;
     if (resStatus && resStatus >= 400) {
-      console.warn(`[${taskId}] navigation returned status ${status} for ${url}`);
+      logger.log(`[${taskId}] navigation returned status ${status} for ${url}`);
       // decide whether to continue or return empty
       return [];
     }
 
-    console.log('Attempting to Enter US Zip');
+    logger.info('Attempting to Enter US Zip');
 
     // Wait for the location modal to appear (use the modal xpath that Amazon uses)
     const modalLocator = page.locator(`xpath=/html/body/div[5]`);
 
     await modalLocator.waitFor({ timeout: 8000 }).catch( async() => {
       // If modal didn't appear, try a bit longer and retry Deliver-to click once
-      console.log('Location modal not detected quickly — retrying Deliver-to click and waiting');
+      logger.info('Location modal not detected quickly — retrying Deliver-to click and waiting');
 
       await handleTopRegionPopup(page);
 
@@ -665,11 +666,9 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
             const changeAddressBtn = page.locator('.a-spacing-top-base:has-text("Change Address")');
 
             if (await changeAddressBtn.count() > 0) {
-              console.log('Found "Change Address" button; attempting to click it...');
-              const clicked = await safeClick(page, changeAddressBtn, { timeout: 10000 });
+              logger.info('Found "Change Address" button; attempting to click it...');              const clicked = await safeClick(page, changeAddressBtn, { timeout: 10000 });
               if (!clicked) {
-                console.warn('safeClick failed on Change Address; trying force-click and DOM click fallback...');
-                try { await changeAddressBtn.first().click({ force: true, timeout: 5000 }); } catch (e) {}
+                logger.info('safeClick failed on Change Address; trying force-click and DOM click fallback...');                try { await changeAddressBtn.first().click({ force: true, timeout: 5000 }); } catch (e) {}
                 try { await page.evaluate(() => {
                   const el = Array.from(document.querySelectorAll('.a-spacing-top-base')).find(n => n && n.textContent && n.textContent.includes('Change Address'));
                   if (el) el.click();
@@ -689,11 +688,10 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
               const zipResult2 = await findZipInputAcrossFrames(page);
 
               if (zipResult2 && zipResult2.locator) {
-                console.log('ZIP input found after clicking Change Address — filling and submitting...');
-                const { locator } = zipResult2;
+                logger.info('ZIP input found after clicking Change Address — filling and submitting...');                const { locator } = zipResult2;
                 try {
                   await locator.fill('10022');
-                } catch (e) { console.warn('Failed to fill ZIP:', e.message); }
+                } catch (e) { logger.info('Failed to fill ZIP:', e.message); }
 
                 // Prefer pressing Enter on the input
                 try {
@@ -703,30 +701,29 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
                     await locator.focus();
                     await page.keyboard.press('Enter');
                   } catch (e2) {
-                    console.warn('Enter press fallbacks failed; will attempt Apply click fallback.');
-                  }
+                     logger.info('Enter press fallbacks failed; will attempt Apply click fallback.');                  }
                 }
 
                 // after opening modal and short wait:
                 await page.waitForTimeout(600);
                 const ok = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
                 if (!ok) {
-                  console.warn('Could not close modal via Continue — skipping ZIP and proceeding to scrape (or abort).');
+                  logger.info('Could not close modal via Continue — skipping ZIP and proceeding to scrape (or abort).');                
                 } else {
-                  console.log('Modal closed successfully after ZIP submission');
+                  logger.info('Modal closed successfully after ZIP submission');
                   zipHandled = true;
                   await page.waitForTimeout(300);
                 }
                  // Wait briefly for search results to appear
                 await waitForSearchResultsOrTimeout(page, 8000);
-                console.log('ZIP submit attempted; continue with scraping.');
+                logger.info('ZIP submit attempted; continue with scraping.');
                 // Verify zip is set, after modal closed and before scraping
                 await zipVerify(page);
               } else {
-                console.log('Still no ZIP input after clicking Change Address. Skipping ZIP step (modal may require sign-in).');
+               logger.info('Still no ZIP input after clicking Change Address. Skipping ZIP step (modal may require sign-in).');
               }
             } else {
-              console.log('"Change Address" button not found in modal; skipping that step.');
+                logger.info('"Change Address" button not found in modal; skipping that step.');            
             }
           } catch (err) {
             const stamp = Date.now();
@@ -735,33 +732,33 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
             console.warn('Error handling Change Address (saved debug). Error:', err.message);
           }
           if (!zipHandled) {
-            console.log('No ZIP input found (modal may require sign-in or be different). Skipping ZIP step.');
+            logger.info('No ZIP input found (modal may require sign-in or be different). Skipping ZIP step.');
           }
         } else {
-          console.log('Found ZIP input in frame, selector:', zipResult.selector);
+          logger.info('Found ZIP input in frame, selector:', zipResult.selector);
           const { frame, locator } = zipResult;
           
           try {
             await locator.fill('10022');
-            console.log('Filled Zip 10022');
+            logger.info('Filled Zip 10022');
             await locator.press('Enter');
-            console.log('Pressed Enter to Apply');
+            logger.info('Pressed Enter to Apply');
 
             await page.waitForTimeout(600);
             const ok = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
             if (!ok) {
-              console.warn('Could not close modal via Continue — skipping ZIP and proceeding to scrape.');
+              logger.info('Could not close modal via Continue — skipping ZIP and proceeding to scrape.');
             } else {
-              console.log('Modal closed successfully after ZIP submission');
+              logger.info('Modal closed successfully after ZIP submission');
               zipHandled = true;
               await page.waitForTimeout(300);
             }
           } catch (e) {
-            console.warn('ZIP submission failed:', e.message);
+            logger.info('ZIP submission failed:', e.message);
           }
         }
         } catch(e){ 
-      console.warn('Modal handling error:', e.message);
+      logger.info('Modal handling error:', e.message);
     }
 
     // Verify zip is set, after modal closed and before scraping
@@ -780,7 +777,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     const resultsLocator = page.locator('div[data-component-type="s-search-result"]');
     const count = await resultsLocator.count();
     const available = Math.min(count, MAX_RESULTS);
-    console.log(`Found ${count} results on page; scraping top ${available}`);
+    logger.info(`Found ${count} results on page; scraping top ${available}`);
 
     // Take a page screenshot of loaded results for debugging
     try {
@@ -814,7 +811,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
 
       // Skip duplicates based on link
       if (link && seenLinks.has(link)) {
-        console.log(`Skipping duplicate product at position ${i + 1}: ${link}`);
+        logger.info(`Skipping duplicate product at position ${i + 1}: ${link}`);
         continue;
       }
       if (link) seenLinks.add(link);
@@ -875,10 +872,10 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
         price: price || null,
       });
     }
-    console.log(`[${taskId}] scraped ${scraped.length} unique items for`, searchTerm);
+    logger.log(`[${taskId}] scraped ${scraped.length} unique items for`, searchTerm);
     return scraped;
   } catch (err) {
-    console.error(`[${taskId}] scrape error for ${searchTerm}:`, err);
+    logger.log(`[${taskId}] scrape error for ${searchTerm}:`, err);
     return [];
   } finally {
     // close only what we created
@@ -897,7 +894,7 @@ if (require.main === module) {
     const term = process.argv.slice(2).join(' ') || 'costume fitness trainer';
     try {
       const results = await runPlaywrightFor(term);
-      console.log('Done. Got', results.length, 'items.');
+      logger.log('Done. Got', results.length, 'items.');
     } catch (e) {
       console.error(e);
       process.exit(1);

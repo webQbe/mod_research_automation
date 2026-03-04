@@ -6,6 +6,7 @@ const pLimit = require('p-limit'); // npm i p-limit
 const { runPlaywrightFor } = require('./amazon-scrape'); // your existing function
 const cors = require('cors');
 const { chromium } = require('playwright'); // or import from your existing setup
+const logger = require('./logger');
 
 
 const app = express();
@@ -47,16 +48,14 @@ async function forwardToWebhook(payload, attempt = 0) {
   const MAX_ATTEMPTS = 5;
   const taskId = payload.clientId !== undefined ? `[${payload.clientId}]` : '';
   try {
-
-    console.log(`${taskId} Forwarding to webhook (attempt ${attempt + 1}/${MAX_ATTEMPTS})...`);
-    console.log(`${taskId} Payload summary: search="${payload.search_term}", results=${Array.isArray(payload.scrapeResult) ? payload.scrapeResult.length : 0}`);
+    logger.log(`${taskId} Forwarding to webhook (attempt ${attempt + 1}/${MAX_ATTEMPTS})...`);    console.log(`${taskId} Payload summary: search="${payload.search_term}", results=${Array.isArray(payload.scrapeResult) ? payload.scrapeResult.length : 0}`);
     const resp = await axios.post(WEBHOOK_URL, payload, { headers: {'Content-Type':'application/json'}, timeout: 120000 });
     // return { ok:true, status: resp.status, data: resp.data };
     const status = resp.status;
     const data = resp.data;
 
     // Log successful response
-    console.log(`${taskId} ✅ Webhook SUCCESS (status ${status})`);
+    logger.log(`${taskId} ✅ Webhook SUCCESS (status ${status})`);
     // console.log(`${taskId} Response data:`, JSON.stringify(data, null, 2));
 
     // Parse and log detailed info if available
@@ -73,7 +72,7 @@ async function forwardToWebhook(payload, attempt = 0) {
               console.log(`${taskId}     [${idx + 1}] Screenshot=${item.fileId ? 'Saved' : 'No image'}`);          });
         }
       } else {
-        console.warn(`${taskId} ⚠️ Apps Script returned ok=false`);
+        logger.log(`${taskId} ⚠️ Apps Script returned ok=false`);
         if (data.error) console.warn(`${taskId}   Error: ${data.error}`);
         if (data.stack) console.warn(`${taskId}   Stack: ${data.stack}`);
       }
@@ -86,21 +85,21 @@ async function forwardToWebhook(payload, attempt = 0) {
     const responseData = err.response && err.response.data;
 
     // Log error details
-    console.error(`${taskId} ❌ Webhook FAILED (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
-    console.error(`${taskId} Error: ${err.message}`);
-    if (status) console.error(`${taskId} HTTP Status: ${status}`);
+    logger.log(`${taskId} ❌ Webhook FAILED (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+    console.log(`${taskId} Error: ${err.message}`);
+    if (status) console.log(`${taskId} HTTP Status: ${status}`);
     if (responseData) {
-      console.error(`${taskId} Response data:`, JSON.stringify(responseData, null, 2));
+      console.log(`${taskId} Response data:`, JSON.stringify(responseData, null, 2));
     }
 
     const isRetryable = !status || (status >= 500 || status === 429);
     
     if (attempt >= MAX_ATTEMPTS - 1 || !isRetryable) {
-      console.error(`${taskId} 🛑 Giving up after ${attempt + 1} attempts`);
+      logger.log(`${taskId} 🛑 Giving up after ${attempt + 1} attempts`);
       return { ok:false, error: err.message || 'forward failed', status, responseData };
     }
     const backoff = Math.min(30000, 500 * Math.pow(2, attempt)); // exp backoff
-    console.log(`${taskId} ⏳ Retrying after ${backoff}ms...`);
+    logger.log(`${taskId} ⏳ Retrying after ${backoff}ms...`);
     await sleep(backoff + Math.floor(Math.random()*200));
     
     return forwardToWebhook(payload, attempt + 1);
@@ -129,7 +128,7 @@ app.post('/api/run-bulk', async (req, res) => {
       res.json({ ok:true, accepted: niches.length, concurrency: CONCURRENCY, message: 'Processing started' });
 
       console.log(`\n${'='.repeat(60)}`);
-      console.log(`Starting bulk processing: ${niches.length} niches`);
+      logger.info(`Starting bulk processing: ${niches.length} niches`);
       console.log(`Concurrency: ${CONCURRENCY}`);
       console.log(`Webhook URL: ${WEBHOOK_URL}`);
       console.log(`${'='.repeat(60)}\n`);
@@ -149,7 +148,7 @@ app.post('/api/run-bulk', async (req, res) => {
         // console.log(`Processing niche[${idx}]:`, { searchTerm });
 
         console.log(`\n[${idx}] ${'─'.repeat(50)}`);
-        console.log(`[${idx}] Processing: "${searchTerm}"`);
+        logger.info(`[${idx}] Processing: "${searchTerm}"`);
         console.log(`[${idx}] Main: "${main}", Sub: "${sub}"`);
 
 
@@ -162,7 +161,7 @@ app.post('/api/run-bulk', async (req, res) => {
       try {
         // Pass page/context to your scraper
         const scraped = await runPlaywrightFor(searchTerm, { page, context, browser: sharedBrowser, taskId: idx });
-        console.log(`[${idx}] ✓ Scraped ${scraped.length} results`);
+        logger.info(`[${idx}] ✓ Scraped ${scraped.length} results`);
 
         // forward to webhook
         const payload = { 
@@ -183,7 +182,7 @@ app.post('/api/run-bulk', async (req, res) => {
         taskResult.scrapedCount = scraped.length;
         
         if (webhookResult.ok) {
-            console.log(`[${idx}] ✅ Task completed successfully`);
+            logger.info(`[${idx}] ✅ Task completed successfully`);
           } else {
             console.error(`[${idx}] ⚠️ Task completed but webhook failed`);
         }
@@ -205,7 +204,7 @@ app.post('/api/run-bulk', async (req, res) => {
 
     // Final summary
     console.log(`\n${'='.repeat(60)}`);
-    console.log(`BULK PROCESSING COMPLETE`);
+    logger.info(`BULK PROCESSING COMPLETE`);
     console.log(`${'='.repeat(60)}`);
     console.log(`Total tasks: ${results.length}`);
     console.log(`Successful: ${results.filter(r => r.success).length}`);
