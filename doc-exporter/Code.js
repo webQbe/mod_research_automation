@@ -13,7 +13,7 @@ function buildAndMergeByMainNiche() {
   if (!sheet) { SpreadsheetApp.getUi().alert('Sheet "raw_data" not found.'); return; }
 
   // Fill down main+sub until next non-empty
-  fillMainSub_fillDown(sheet);
+  fillMainSub_fillDown_withGeneral(sheet);
   
   // Ensure images are saved to Drive and drive_image_file_id columns are written first
   saveImagesForSheet();
@@ -123,22 +123,40 @@ function buildAndMergeByMainNiche() {
   Logger.log(JSON.stringify(created,null,2));
 }
 
-function fillMainSub_fillDown(sheet) {
+/**
+   * Fill down main_niche and sub_niche, but first set sub_niche = "General"
+   * for any row that has a main_niche but an empty sub_niche.
+   *
+   * Call this BEFORE you build `rows`. After calling, re-read the sheet data.
+*/
+function fillMainSub_fillDown_withGeneral(sheet) {
   const lastCol = sheet.getLastColumn();
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return;
 
-  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h).trim());
-  const cMain = headers.indexOf('main_niche');
-  const cSub  = headers.indexOf('sub_niche');
+  // tolerant header lookup
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || '').trim());
+  const norm = s => String(s || '').trim().toLowerCase().replace(/[_\s]+/g, '');
+  const cMain = headers.findIndex(h => norm(h) === 'mainniche' || norm(h) === 'main_niche' || norm(h) === 'main');
+  const cSub  = headers.findIndex(h => norm(h) === 'subniche'  || norm(h) === 'sub_niche'  || norm(h) === 'sub');
   if (cMain === -1 || cSub === -1) {
-    Logger.log('Headers main_niche or sub_niche not found.');
-    return;
+      Logger.log('Headers main_niche or sub_niche not found. Aborting fill-down.');
+      return;
   }
 
   const dataRange = sheet.getRange(2, 1, lastRow - 1, lastCol);
   const data = dataRange.getValues();
 
+  // Step 1: where main exists but sub is blank, set sub = "General"
+  for (let i = 0; i < data.length; i++) {
+    const mainVal = String(data[i][cMain] || '').trim();
+    const subVal  = String(data[i][cSub]  || '').trim();
+    if (mainVal && !subVal) {
+      data[i][cSub] = 'General';
+    }
+  }
+
+  // Step 2: fill down main and sub (now with 'General' set where appropriate)
   let lastMain = '';
   let lastSub = '';
 
@@ -146,21 +164,23 @@ function fillMainSub_fillDown(sheet) {
     const curMain = String(data[i][cMain] || '').trim();
     const curSub  = String(data[i][cSub]  || '').trim();
 
+    // main: inherit lastMain if empty
     if (curMain) {
       lastMain = curMain;
     } else if (lastMain) {
       data[i][cMain] = lastMain;
     }
 
+    // sub: inherit lastSub if empty
     if (curSub) {
       lastSub = curSub;
     } else if (lastSub) {
       data[i][cSub] = lastSub;
     }
   }
-
+  // write back once
   dataRange.setValues(data);
-  Logger.log('Filled down main_niche/sub_niche for all blank rows.');
+  Logger.log('Filled main_niche/sub_niche with General for main rows missing sub, then filled down.');
 }
 
 /**
