@@ -3,7 +3,7 @@ const express = require('express');
 const fetch = global.fetch || require('node-fetch'); // node <18 fallback
 const { runPlaywrightFor } = require('./amazon-scrape'); // your existing scraper
 
-const PORT = process.env.PORT || '';
+const PORT = process.env.PORT || 8080;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || ''; // optional for forwarding
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
 
@@ -37,7 +37,7 @@ function normalizeKeywords(k) {
   return arr.length > 1 ? arr : (arr[0] || '');
 }
 
-app.post('/run-scrape', async (req, res) => {
+app.post('/api/run-scrape', async (req, res) => {
   try {
     console.log('--- HEADERS ---');
     console.log(req.headers);
