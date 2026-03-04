@@ -17,6 +17,132 @@ const DEFAULT_USER_AGENTS = [
 
 function randChoice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
+// call this right after opening the modal to see what Amazon showed
+async function inspectModalAndSave(page, tag = '') {
+  const stamp = Date.now();
+  const png = `debug-modal-${tag || 'auto'}-${stamp}.png`;
+  const html = `debug-modal-${tag || 'auto'}-${stamp}.html`;
+
+  // save screenshot
+  try { await page.screenshot({ path: png, fullPage: true }); } catch (e) { /* ignore */ }
+
+  // try to find modal containers and print their text content
+  const modalSelectors = [
+    '.a-popover', 
+    '.a-popover-modal',
+    '.a-divider',
+    '.a-divider-break',
+    '.a-spacing-top-base',
+    'div[id^="a-popover-2"]', 
+    'div[id^="glow-root"]',
+  ];
+  const results = [];
+
+  for (const sel of modalSelectors) {
+    try {
+      const loc = page.locator(sel);
+      const cnt = await loc.count();
+      for (let i = 0; i < cnt; i++) {
+        const n = loc.nth(i);
+        const visible = await n.isVisible().catch(() => false);
+        const text = await n.innerText().catch(() => '');
+        results.push({ selector: sel, index: i, visible, text: text.slice(0, 1000) }); // limit size
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // save a snapshot of the page HTML for inspection (useful if run in CI)
+  try {
+    const content = await page.content();
+    require('fs').writeFileSync(html, content);
+  } catch (e) { /* ignore */ }
+
+  console.log('Saved modal debug files:', png, html);
+  console.log('Modal candidates found (selector, index, visible, text-snippet):\n', results);
+  return { png, html, modalSummaries: results };
+}
+
+// returns { frame, locator, selector } or null
+async function findZipInputAcrossFrames(page) {
+  const selectors = [
+    // direct xpaths you mentioned
+    'xpath=/html/body/div[18]//input',
+    'xpath=/html/body/div[19]//input',
+    'xpath=/html/body/div[5]//input',
+    // specific candidate xpaths for input
+    'xpath=/html/body/div[18]//input[contains(@id,"GLUX") or contains(@name,"zip") or contains(@aria-label,"ZIP")]',
+    'xpath=/html/body//input[contains(@name,"zip") or contains(@id,"zip") or contains(@placeholder,"ZIP")]',
+    // css selectors
+    'input#GLUXZipUpdateInput',
+    'input#GLUXZipInput',
+    'input[name="zipCode"]',
+    'input[aria-label*="ZIP"]',
+    'input[placeholder*="ZIP"]'
+  ];
+
+  // helper to check locator visibility & attributes heuristics
+  async function evaluateLocator(frame, loc) {
+    try {
+      if (await loc.count() === 0) return null;
+      const first = loc.first();
+      if (!(await first.isVisible().catch(() => false))) return null;
+      // read attributes to confirm
+      const attrs = await first.evaluate(el => ({
+        id: el.id || '',
+        name: el.name || '',
+        placeholder: el.placeholder || '',
+        aria: el.getAttribute('aria-label') || ''
+      }));
+      const combined = (attrs.id + ' ' + attrs.name + ' ' + attrs.placeholder + ' ' + attrs.aria).toLowerCase();
+      if (combined.includes('zip') || combined.includes('postal') || combined.includes('zipcode') || combined.includes('zip code')) {
+        return { frame, locator: first, selector: 'matched' };
+      }
+      // if visible but doesn't contain "zip", still return it as a candidate
+      return { frame, locator: first, selector: 'visible-candidate' };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // 1) search main frame
+  for (const sel of selectors) {
+    try {
+      const loc = sel.startsWith('xpath=') ? page.locator(sel.slice(6)) : page.locator(sel);
+      const res = await evaluateLocator(page, loc);
+      if (res) return res;
+    } catch (e) { /* ignore */ }
+  }
+
+  // 2) search all child frames
+  const frames = page.frames();
+  for (const frame of frames) {
+    // skip main frame (already checked)
+    if (frame === page.mainFrame()) continue;
+    for (const sel of selectors) {
+      try {
+        const loc = sel.startsWith('xpath=') ? frame.locator(sel.slice(6)) : frame.locator(sel);
+        const res = await evaluateLocator(frame, loc);
+        if (res) return res;
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  // 3) last resort: find any visible input inside any dialog and return first match
+  try {
+    const dialogInputs = page.locator('div[role="dialog"] input, .a-popover input, .a-modal input');
+    const count = await dialogInputs.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const ip = dialogInputs.nth(i);
+      if (await ip.isVisible().catch(() => false)) {
+        return { frame: page, locator: ip, selector: 'dialog-first-visible' };
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  return null;
+}
+
+
 function extractNumberFromText(s) {
         if (!s) return null;
         // keep digits and commas, remove stuff like "ratings" or "stars"
@@ -275,6 +401,172 @@ async function handleTopRegionPopup(page) {
   }
 }
 
+// Call this after opening the modal to ensure it is closed via the "Continue" button.
+async function waitForModalClosed(page, opts = {}) {
+  const timeout = opts.timeout ?? 10000;
+  const start = Date.now();
+  const poll = opts.pollInterval ?? 300;
+
+  // modal locators to consider "modal is open"
+  const modalLocator = page.locator('div[role="dialog"], .a-popover, div[id^="a-popover"], .a-modal');
+
+  while (Date.now() - start < timeout) {
+    try {
+      const count = await modalLocator.count();
+      let anyVisible = false;
+      for (let i = 0; i < count; i++) {
+        try {
+          if (await modalLocator.nth(i).isVisible()) { anyVisible = true; break; }
+        } catch (e) { /* ignore per-item errors */ }
+      }
+      if (!anyVisible) return true; // no visible modals -> closed
+    } catch (e) {
+      // if locator query fails, sleep and try again
+    }
+    await page.waitForTimeout(poll);
+  }
+  return false; // timed out while modal still appears visible
+}
+
+// Enhanced modal close helper: call after modal appears
+async function closeModalWithContinueEnhanced(page, opts = {}) {
+  const timeout = opts.timeout ?? 15000;
+  const poll = opts.pollInterval ?? 300;
+  const start = Date.now();
+
+  // Candidate Continue selectors
+  const continueSelectors = [
+    '#a-autoid-3',
+    'input#GLUXConfirmClose',
+    '#GLUXConfirmClose',
+    'span.a-button-text:has-text("Continue")',
+    'button:has-text("Continue")',
+    'xpath=/html/body/div[6]//input[@id="GLUXConfirmClose"]',
+    'xpath=/html/body/div[7]//input[@id="GLUXConfirmClose"]',
+    'xpath=//input[@id="GLUXConfirmClose"]',
+    'xpath=//span[contains(.,"Continue")]/input'
+  ];
+
+  // 1) Capture currently visible modal-like element handles so we can watch them
+  const modalLocator = page.locator('div[role="dialog"], .a-popover, div[id^="a-popover"], .a-modal');
+  const initialHandles = [];
+  try {
+    const modalCount = await modalLocator.count();
+    for (let i = 0; i < modalCount; i++) {
+      const loc = modalLocator.nth(i);
+      if (await loc.isVisible().catch(() => false)) {
+        const handle = await loc.elementHandle();
+        if (handle) initialHandles.push(handle);
+      }
+    }
+  } catch (e) {
+    // ignore capture errors
+  }
+
+  // Helper: check if all captured handles are gone/hidden
+  async function capturedModalsGoneOrHidden() {
+    try {
+      if (initialHandles.length === 0) {
+        // no explicit handles captured — fall back to generic no visible dialog
+        const anyVisible = await page.locator('div[role="dialog"], .a-popover, div[id^="a-popover"], .a-modal').filter({ hasText: '' }).count().catch(() => 0);
+        return anyVisible === 0;
+      }
+      // Evaluate each handle in page context to see if connected & visible
+      for (const h of initialHandles) {
+        try {
+          // if handle is detached, treat as gone
+          const isConnected = await page.evaluate(el => !!el && !!el.isConnected, h).catch(() => false);
+          if (!isConnected) continue;
+          // check visibility via offsetParent or computed style
+          const isVisible = await page.evaluate((el) => {
+            try {
+              const cs = window.getComputedStyle(el);
+              const rect = el.getBoundingClientRect();
+              return cs && cs.display !== 'none' && cs.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            } catch (e) { return false; }
+          }, h).catch(() => false);
+          if (isVisible) return false; // at least one captured modal still visible
+        } catch (e) {
+          // if any per-handle check fails, be conservative and assume it's still present
+          return false;
+        }
+      }
+      return true; // all captured handles gone or not visible
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 2) Try candidate continue selectors
+  for (const sel of continueSelectors) {
+    if (Date.now() - start > timeout) break;
+    try {
+      const loc = sel.startsWith('xpath=') ? page.locator(sel.slice(6)) : page.locator(sel);
+      if (await loc.count() === 0) continue;
+      const first = loc.first();
+      // try clicking via safeClick helper
+      const clicked = await safeClick(page, first, { timeout: 8000 }).catch(() => false);
+      if (!clicked) {
+        // fallback: focus+enter
+        try { await first.focus(); await page.keyboard.press('Enter'); } catch (e) {}
+      }
+      // After attempting click, wait for captured modals to disappear
+      const remainingTime = Math.max(1000, timeout - (Date.now() - start));
+      const endWait = Date.now() + remainingTime;
+      while (Date.now() < endWait) {
+        if (await capturedModalsGoneOrHidden()) {
+          return true; // closed successfully
+        }
+        await page.waitForTimeout(poll);
+      }
+      // Not closed after this selector — try the next
+    } catch (e) {
+      // continue to next selector
+    }
+  }
+
+  // 3) Try escape + outside click fallback
+  try {
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.mouse.click(10, 10).catch(() => {});
+    // wait short time
+    const endWait = Date.now() + 3000;
+    while (Date.now() < endWait) {
+      if (await capturedModalsGoneOrHidden()) return true;
+      await page.waitForTimeout(poll);
+    }
+  } catch (e) { /* ignore */ }
+
+  // 4) If still present, forcibly hide/remove the captured modal elements and known overlays (last-resort)
+  try {
+    await page.evaluate(() => {
+      // remove/hide common overlays
+      const overlayIds = ['redir-overlay', 'glow-ingress-overlay'];
+      overlayIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) { el.style.pointerEvents = 'none'; el.style.display = 'none'; }
+      });
+      // hide any visible dialogs/popovers
+      document.querySelectorAll('div[role="dialog"], .a-popover, .a-modal, div[id^="a-popover"]').forEach(el => {
+        try { el.style.pointerEvents = 'none'; el.style.display = 'none'; } catch(e) {}
+      });
+    });
+    // short wait for DOM to settle
+    await page.waitForTimeout(500);
+    if (await capturedModalsGoneOrHidden()) return true;
+  } catch (e) { /* ignore */ }
+
+  // 5) Give up — capture debug artifacts and return false
+  try {
+    const stamp = Date.now();
+    await page.screenshot({ path: `debug-modal-still-open-${stamp}.png`, fullPage: true }).catch(() => {});
+    fs.writeFileSync(`debug-modal-still-open-${stamp}.html`, await page.content().catch(() => '<no html>'));
+    console.warn('Modal did not close — debug files saved:', `debug-modal-still-open-${stamp}.png`, `debug-modal-still-open-${stamp}.html`);
+  } catch (e) { /* ignore */ }
+
+  return false;
+}
+
 async function runPlaywrightFor(searchTerm) {
   const browser = await chromium.launch({
     headless: HEADLESS,
@@ -290,7 +582,7 @@ async function runPlaywrightFor(searchTerm) {
 
   try {
     // Build search URL
-    const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&rh=p_6%3AATVPDKIKX0DER&dc&crid=341Y28BNDVEK3&qid=1769417689&refresh=1&rnid=2661622011&sprefix=anime+isekai+shir%2Caps%2C513&ref=sr_nr_p_6_1&ds=v1%3AIoLNoc5Kc0DelNJ36v6Y96fbJG43zKgZx8C4Fbpu5c4`;
+     const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&i=fashion&rh=n%3A7141123011%2Cn%3A7147445011%2Cn%3A12035955011%2Cn%3A9103696011%2Cp_6%3AATVPDKIKX0DER&s=exact-aware-popularity-rank&dc&crid=32KWX5YSMPKFS&qid=1769802877&rnid=12035955011&sprefix=${encodeURIComponent(searchTerm)}%2Cfashion%2C1382&ref=sr_st_exact-aware-popularity-rank&ds=v1%3Aj3gHDOxV25aXkkzkP3BVzm%2FKIALNeMjnRSV99ITAu1E`;
     console.log('Navigating to:', searchUrl);
 
     // Use safe goto with retry/backoff
@@ -303,171 +595,136 @@ async function runPlaywrightFor(searchTerm) {
     console.log('Attempting to Enter US Zip');
 
     // Wait for the location modal to appear (use the modal xpath that Amazon uses)
-    const modalLocator = page.locator('xpath=/html/body/div[18]');
+    const modalLocator = page.locator(`xpath=/html/body/div[5]`);
 
     await modalLocator.waitFor({ timeout: 8000 }).catch( async() => {
       // If modal didn't appear, try a bit longer and retry Deliver-to click once
       console.log('Location modal not detected quickly — retrying Deliver-to click and waiting');
-      
-      // Take a page screenshot for debugging > Location modal not detected
-      try {
-        const scPath = screenshotFilePath({ dir: 'screenshots', prefix: 'no-location-modal', term: searchTerm });
-        await await page.screenshot({ path: scPath }).catch(()=>{});
-        console.log('No location modal screenshot:', scPath);
-        const html = `no-location-modal-${searchTerm}.html`;
-        const content = await page.content().catch(()=>'<no-html>');
-        require('fs').writeFileSync(html, content);
-        console.warn('Wrote debug no location modal html:', html);
-        } catch (e) { 
-          console.warn('Could not write "no location modal" debug artifacts:', e.message); 
-        }
-      
       await handleTopRegionPopup(page);
-      
+
       const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
       const deliver = page.locator(`xpath=${deliverToXpath}`);
       if (await deliver.count() > 0) {
         await removeOverlayIfPresent(page);
         await safeClick(page, deliver, { timeout: 5000 }).catch(()=>{});
       }
+
       return modalLocator.waitFor({ timeout: 9000 });
     });
 
     // Now modalLocator should represent the modal; take a scoped screenshot for debugging
     try {
-      const scPath = screenshotFilePath({ dir: 'screenshots', prefix: 'modal-scoped', term: searchTerm });
-      await modalLocator.first().screenshot({ path: scPath }).catch(()=>{});
-      console.log('Modal scoped screenshot:', scPath);
-    } catch(e){ /* ignore */ }
-
-    // ---------- Enter ZIP code ----------
-    const zipSelectors = [
-      'input#GLUXZipUpdateInput',
-      'input[name="zipCode"]',
-      'input[aria-label*="ZIP"]',
-      'xpath=/html/body/div[18]//input',
-      'input#GLUXZipInput'
-    ];
-
-    let zipLocator = null;
-    for (const sel of zipSelectors) {
-      const loc = sel.startsWith('xpath=') ? page.locator(sel) : page.locator(sel);
-      if (await loc.count() > 0) { zipLocator = loc.first(); break; }
-    }
-
-    if (!zipLocator) {
-        console.warn('ZIP input not found; skipping ZIP entry/apply.');
-        const stamp = Date.now();
-        await page.screenshot({ path: `debug-zip-input-not-opened-${stamp}.png`, fullPage: true }).catch(()=>{});
-    } else {
-      // Fill the ZIP
-      await zipLocator.fill(ZIP).catch(() => { });
-      console.log('Filled ZIP');
-      await page.waitForTimeout(250); // small pause
-
-      // Try 1: press Enter on the input locator
-      try {
-        console.log('Attempting locator.press("Enter") to submit ZIP');
-        await zipLocator.press('Enter', { timeout: 8000 });
-        await page.waitForTimeout(1000);
-      } catch (e) {
-        console.warn('locator.press Enter failed (will try other fallbacks)');
-        const stamp = Date.now();
-        await page.screenshot({ path: `debug-zip-enter-submit-failed-${stamp}.png`, fullPage: true }).catch(()=>{});
-
-        // Try 2: focus then page.keyboard.press('Enter')
-        try {
-          await zipLocator.focus();
-          await page.keyboard.press('Enter');
-          await page.waitForTimeout(1000);
-        } catch (e2) {
-          console.warn('page.keyboard.press Enter failed (will try form submit/click)');
-          const stamp = Date.now();
-          await page.screenshot({ path: `debug-zip-focus-submit-failed-${stamp}.png`, fullPage: true }).catch(()=>{});
-
-
-          // Try 3: submit the form via DOM (if input is inside a form)
+      // after opening the modal and waiting a bit:
+        await page.waitForTimeout(800);
+        const debug = await inspectModalAndSave(page, 'after-open'); // optional: helpful
+        const zipResult = await findZipInputAcrossFrames(page);
+        if (!zipResult) {
+          // --- handle "Change Address" button and retry ZIP detection ---
           try {
-            await page.evaluate(() => {
-              const input = document.querySelector('input#GLUXZipUpdateInput, input[name="zipCode"], input[aria-label*="ZIP"]');
-              if (input && input.form) input.form.submit();
-            });
-            await page.waitForTimeout(1000);
-          } catch (e3) {
-            console.warn('DOM form.submit() failed (will try clicking apply control)');
+             // Try to click the "Change Address" button inside the modal
+            const changeAddressBtn = page.locator('.a-spacing-top-base:has-text("Change Address")');
+
+            if (await changeAddressBtn.count() > 0) {
+              console.log('Found "Change Address" button; attempting to click it...');
+              const clicked = await safeClick(page, changeAddressBtn, { timeout: 10000 });
+              if (!clicked) {
+                console.warn('safeClick failed on Change Address; trying force-click and DOM click fallback...');
+                try { await changeAddressBtn.first().click({ force: true, timeout: 5000 }); } catch (e) {}
+                try { await page.evaluate(() => {
+                  const el = Array.from(document.querySelectorAll('.a-spacing-top-base')).find(n => n && n.textContent && n.textContent.includes('Change Address'));
+                  if (el) el.click();
+                }); } catch (e) {}
+              }
+
+              // Give the modal a moment to change to the address form
+              await page.waitForTimeout(900);
+
+              // Optional: save a debug snapshot to inspect what changed
+              await inspectModalAndSave(page, 'after-click-change-address');
+
+              // Short wait for any dynamic content
+              await page.waitForTimeout(700);
+
+              // Retry finding the ZIP input (search frames too)
+              const zipResult2 = await findZipInputAcrossFrames(page);
+
+              if (zipResult2 && zipResult2.locator) {
+                console.log('ZIP input found after clicking Change Address — filling and submitting...');
+                const { locator } = zipResult2;
+                try {
+                  await locator.fill('10022');
+                } catch (e) { console.warn('Failed to fill ZIP:', e.message); }
+
+                // Prefer pressing Enter on the input
+                try {
+                  await locator.press('Enter', { timeout: 8000 });
+                } catch (e) {
+                  try {
+                    await locator.focus();
+                    await page.keyboard.press('Enter');
+                  } catch (e2) {
+                    console.warn('Enter press fallbacks failed; will attempt Apply click fallback.');
+                  }
+                }
+
+                // after opening modal and short wait:
+                await page.waitForTimeout(600);
+                const ok = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
+                if (!ok) {
+                  console.warn('Could not close modal via Continue — skipping ZIP and proceeding to scrape (or abort).');
+                  // decide: skip ZIP, or abort run, or try a different flow
+                } else {
+                  // modal closed — safe to start scraping
+                  await page.waitForTimeout(300); // small buffer
+                }
+
+                // Wait briefly for modal to react and search results to appear (if modal closes)
+                await page.waitForTimeout(1100);
+                await waitForSearchResultsOrTimeout(page, 8000);
+                console.log('ZIP submit attempted; continue with scraping.');
+              } else {
+                console.log('Still no ZIP input after clicking Change Address. Skipping ZIP step (modal may require sign-in).');
+              }
+            } else {
+              console.log('"Change Address" button not found in modal; skipping that step.');
+            }
+          } catch (err) {
             const stamp = Date.now();
-            await page.screenshot({ path: `debug-zip-dom-submit-failed-${stamp}.png`, fullPage: true }).catch(()=>{});
+            try { await page.screenshot({ path: `debug-change-address-fail-${stamp}.png`, fullPage: true }); } catch(e){}
+            try { fs.writeFileSync(`debug-change-address-fail-${stamp}.html`, await page.content()); } catch(e){}
+            console.warn('Error handling Change Address (saved debug). Error:', err.message);
+          }
+          console.log('No ZIP input found (modal may require sign-in or be different). Skipping ZIP step.');
+          // optionally bail out of modal flow and continue scraping without ZIP
+        } else {
+          console.log('Found ZIP input in frame, selector:', zipResult.selector);
+          const { frame, locator } = zipResult; // locator is Playwright Locator bound to the frame
+          // fill and submit: press enter, or safe click apply, etc.
+          await locator.fill('10022').catch(() => {});
+          console.log('Filled Zip 10022');
+          await locator.press('Enter').catch(() => {});
+          console.log('Pressed Enter to Apply');
+          await locator.press('Enter').catch(() => {});
+          console.log('Pressed Enter to Continue');
 
+          // after opening modal and short wait:
+          await page.waitForTimeout(600);
+          const ok = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
+          if (!ok) {
+            console.warn('Could not close modal via Continue — skipping ZIP and proceeding to scrape (or abort).');
+            // decide: skip ZIP, or abort run, or try a different flow
+          } else {
+            // modal closed — safe to start scraping
+            await page.waitForTimeout(300); // small buffer
+            
           }
         }
-      }
-
-      // After submitting, wait for results selector briefly
-      const sawResults = await waitForSearchResultsOrTimeout(page, 8000);
-      if (!sawResults) {
-        // Try clicking Apply as fallback
-        const applySelectors = [
-          'xpath=/html/body/div[18]//span/span/input',
-          'input#GLUXZipUpdate',
-          'input[type="submit"][aria-label*="Apply"]',
-          'button:has-text("Apply")',
-          'button:has-text("Apply ZIP")'
-        ];
-
-        let applied = false;
-        for (const s of applySelectors) {
-          const loc = s.startsWith('xpath=') ? page.locator(s) : page.locator(s);
-          if (await loc.count() > 0) {
-            await removeOverlayIfPresent(page);
-            applied = await safeClick(page, loc, { timeout: 15000 });
-            if (applied) break;
-          }
-        }
-
-        if (!applied) {
-          console.warn('Apply control not found or click failed; attempting JS click fallback.');
-          const stamp = Date.now();
-          await page.screenshot({ path: `debug-no-zip-apply-btn-${stamp}.png`, fullPage: true }).catch(()=>{});
-          try {
-            await page.evaluate(() => {
-              const cand = document.querySelector('input[type="submit"], input#GLUXZipUpdate, button');
-              if (cand) cand.click();
-            });
-          } catch (e) { /* ignore */ }
-        }
-      }
-    } // end zipLocator check  
-
-
-    // Try Enter to continue (some flows need another click)
-    try {
-      console.log('Attempting page.keyboard.press("Enter") to continue');
-      await page.keyboard.press('Enter', { timeout: 8000 }).catch(() => { });
-      await page.waitForTimeout(1000);
-    } catch (e) {
-      console.warn('keyboard press Enter failed (will try Continue selectors)');
-      // Try Continue selectors
-      const contSelectors = [
-        'xpath=/html/body/div[19]//input',
-        'input#GLUXConfirmClose',
-        'button:has-text("Continue")',
-        'button:has-text("Done")'
-      ];
-      for (const s of contSelectors) {
-        const loc = s.startsWith('xpath=') ? page.locator(s) : page.locator(s);
-        if (await loc.count() > 0) {
-          await removeOverlayIfPresent(page);
-          const ok = await safeClick(page, loc, { timeout: 12000 });
-          if (ok) break;
-        }
-      }
-    }
+        } catch(e){ /* ignore */ }
 
     // Final: wait for actual search results to appear (no strict networkidle)
     await waitForSearchResultsOrTimeout(page, 30000);
     await page.waitForTimeout(800);
-
-   
+    
     // Wait a little for results to reload after sorting/ZIP change
     await sleep(1200);
 
@@ -547,7 +804,6 @@ async function runPlaywrightFor(searchTerm) {
 
       console.log('rawReviewCount:', rawReviewCount, '->', reviewCountValue, reviewCountFormatted);
 
-          
       // Price
       const price = await trySelectorsText(r, [
         'span.a-price > span.a-offscreen',
