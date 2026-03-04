@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const fetch = global.fetch || require('node-fetch'); // node <18 fallback
 const { runPlaywrightFor } = require('./amazon-scrape'); // your existing scraper
+const { buildSearchTerm } = require('./search-term');
 
 const PORT = process.env.PORT || 8080;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || ''; // optional for forwarding
@@ -15,7 +16,6 @@ app.use(cors({
   methods: ['POST'],
   allowedHeaders: ['Content-Type']
 }));
-
 
 // use express.json with verify to capture raw body safely
 app.use(express.json({
@@ -60,12 +60,7 @@ app.post('/api/run-scrape', async (req, res) => {
     console.log('Normalized keywords:', keywords);
 
     // Build search term
-    const parts = [];
-    if (main_niche) parts.push(main_niche);
-    if (sub_niche) parts.push(sub_niche);
-    parts.push('shirt');
-    const searchTerm = parts.join(' ').replace(/\s+/g, ' ').trim().toLowerCase();;
-
+    const searchTerm = buildSearchTerm(main_niche, sub_niche);
     console.log('Built searchTerm:', searchTerm);
 
     // run your scraper
@@ -87,8 +82,7 @@ app.post('/api/run-scrape', async (req, res) => {
           search_term: searchTerm,
           scrapeResult
       };
-      
-      try {
+    try {
           const webhookResp = await fetch(WEBHOOK_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -100,7 +94,7 @@ app.post('/api/run-scrape', async (req, res) => {
           console.log('Forwarded to webhook, status:', webhookResp.status);
           console.log('Webhook body (preview):', text.slice(0,2000));
           return res.json({ ok: true, forwarded: true, webhookStatus: webhookResp.status, scrapedCount: scrapeResult.length });
-      } catch(err) {
+        } catch(err) {
           console.error("Webhook forwarding failed:", err.message);
           console.log("Url:", WEBHOOK_URL);
       }

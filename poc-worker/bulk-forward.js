@@ -7,6 +7,7 @@ const { runPlaywrightFor } = require('./amazon-scrape'); // your existing functi
 const cors = require('cors');
 const { chromium } = require('playwright'); // or import from your existing setup
 const logger = require('./logger');
+const { buildSearchTerm } = require('./search-term');
 
 
 const app = express();
@@ -18,28 +19,6 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL; // Apps Script /exec URL
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || 'supersecret123'; // webhook token expected by Apps Script
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || ''; // token to accept bulk requests from client (optional)
 const CONCURRENCY = Number(process.env.CONCURRENCY || 2); // parallel Playwright runs
-const STYLE = ['vintage', 'retro', 'funny', 'cute'];
-const INTENT = ['gift', 'shirt', 'tshirt', 'graphic tee'];
-
-function buildSearchTerm(main, sub, idx = 0) {
-  /**
-   * buildSearchTerm(main, sub, idx)
-   * - picks a rotating style from STYLE based on idx
-   * - picks a rotating intent from INTENT based on idx
-   * - returns string like: "Fitness Running vintage gift" or "Fitness Animal retro tshirt"
-  */
-  const safeIdx = Math.max(0, Number(idx));
-  const style = STYLE[safeIdx % STYLE.length];
-  const intent = INTENT[safeIdx % INTENT.length];
-  
-  const parts = [];
-  if (main) parts.push(String(main).trim());
-  if (sub) parts.push(String(sub).trim());
-  parts.push(style);
-  parts.push(intent);
-  
-  return parts.filter(Boolean).join(' ').replace(/\s+/g, ' ');
-}
 
 async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
