@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
+import CsvUploader from './CsvUploader';
 
 export default function ScraperForm() {
   const [mainNiche, setMainNiche] = useState('');
@@ -9,7 +10,7 @@ export default function ScraperForm() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
 
-  const endpoint = import.meta.env.VITE_SCRAPER_ENDPOINT || '/run-scrape';
+  const SCRAPER_ENDPOINT = import.meta.env.VITE_SCRAPER_ENDPOINT || 'http://localhost:8080/api/run-scrape';
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -32,7 +33,7 @@ export default function ScraperForm() {
         keywords: keywords.trim()
       };
 
-      const resp = await fetch(endpoint, {
+      const resp = await fetch(SCRAPER_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -54,42 +55,44 @@ export default function ScraperForm() {
   }
 
   return (
-    <form onSubmit={handleSubmit} style={{maxWidth:640,margin:'1rem auto',padding:16,border:'1px solid #eee',borderRadius:8}}>
-      <h2>Run Scraper</h2>
+    <div style={{maxWidth:820, margin:'1rem auto', padding:12}}>
+      <form onSubmit={handleSubmit} style={{maxWidth:640,margin:'1rem auto',padding:16,border:'1px solid #eee',borderRadius:8}}>
+        <h2>Run Scraper</h2>
 
-      <label style={{display:'block',margin:'8px 0'}}>
-        Main niche:
-        <input value={mainNiche} onChange={e=>setMainNiche(e.target.value)} placeholder="e.g. Fitness" style={{width:'100%'}} />
-      </label>
+        <label style={{display:'block',margin:'8px 0'}}>
+          Main niche:
+          <input value={mainNiche} onChange={e=>setMainNiche(e.target.value)} placeholder="e.g. Fitness" style={{width:'100%'}} />
+        </label>
 
-      <label style={{display:'block',margin:'8px 0'}}>
-        Sub niche:
-        <input value={subNiche} onChange={e=>setSubNiche(e.target.value)} placeholder="e.g. Trainer" style={{width:'100%'}} />
-      </label>
+        <label style={{display:'block',margin:'8px 0'}}>
+          Sub niche:
+          <input value={subNiche} onChange={e=>setSubNiche(e.target.value)} placeholder="e.g. Trainer" style={{width:'100%'}} />
+        </label>
 
-      <label style={{display:'block',margin:'8px 0'}}>
-        Keywords (comma separated):
-        <input value={keywords} onChange={e=>setKeywords(e.target.value)} placeholder="e.g. vintage, cool" style={{width:'100%'}} />
-      </label>
+        <label style={{display:'block',margin:'8px 0'}}>
+          Keywords (comma separated):
+          <input value={keywords} onChange={e=>setKeywords(e.target.value)} placeholder="e.g. vintage, cool" style={{width:'100%'}} />
+        </label>
 
-      <label style={{display:'block',margin:'8px 0'}}>
-        Client token:
-        <input value={token} onChange={e=>setToken(e.target.value)} placeholder="" style={{width:'100%'}} />
-      </label>
+        <label style={{display:'block',margin:'8px 0'}}>
+          Client token:
+          <input value={token} onChange={e=>setToken(e.target.value)} placeholder="" style={{width:'100%'}} />
+        </label>
 
-      <div style={{marginTop:12}}>
-        <button type="submit" disabled={loading} style={{padding:'8px 12px'}}>
-          {loading ? 'Running...' : 'Run Scraper'}
-        </button>
-      </div>
-
-      {error && <div style={{color:'crimson',marginTop:12}}>Error: {error}</div>}
-
-      {result && (
-        <pre style={{whiteSpace:'pre-wrap', background:'#f7f7f7', padding:12, marginTop:12}}>
-          {JSON.stringify(result, null, 2)}
-        </pre>
-      )}
-    </form>
+        <div style={{marginTop:12}}>
+          <button type="submit" disabled={loading} style={{padding:'8px 12px'}}>
+            {loading ? 'Running...' : 'Run Scraper'}
+          </button>
+        </div>
+      </form>
+      {/* CSV/upload UI state */}
+        <CsvUploader 
+          token={token} 
+          setError={setError} 
+          setResult={setResult} 
+        /> 
+        {error && <div style={{color:'crimson',marginTop:12}}>Error: {error}</div>}
+        {result && <pre style={{whiteSpace:'pre-wrap', background:'#f7f7f7', padding:12, marginTop:12}}>{JSON.stringify(result, null, 2)}</pre>}
+    </div>
   );
 }

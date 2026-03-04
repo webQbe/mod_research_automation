@@ -3,22 +3,26 @@
   "version": "1.0.0",
   "type": "commonjs",
   "scripts": {
-     "start": "node --network-family-autoselection-attempt-timeout=5000 server.js"
+    "form": "node --network-family-autoselection-attempt-timeout=5000 server.js",
+    "bulk": "node --network-family-autoselection-attempt-timeout=5000 bulk-forward.js",
+    "start": "concurrently \"npm run form\" \"npm run bulk\""
   },
   "dependencies": {
     "@google-cloud/local-auth": "^3.0.1",
+    "@playwright/test": "^1.57.0",
     "axios": "^1.13.3",
     "body-parser": "^1.20.2",
     "cors": "^2.8.6",
     "dotenv": "16.0.0",
     "express": "^4.18.2",
-    "googleapis": "^170.1.0"
+    "googleapis": "^170.1.0",
+    "p-limit": "^3.1.0"
   },
   "overrides": {
     "gtoken": "github:BjornTheProgrammer/node-gtoken"
   },
   "devDependencies": {
-    "@playwright/test": "^1.57.0",
-    "@types/node": "^25.0.9"
+    "@types/node": "^25.0.9",
+    "concurrently": "^9.2.1"
   }
 }
