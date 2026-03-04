@@ -2,6 +2,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const { parseAbbreviatedNumber, formatWithCommas } = require('./utils/abbrev-number');
 const { screenshotFilePath } = require('./fileHelper');
+const path = require('path');
 
 
 const HEADLESS = process.env.HEADLESS !== '0'; // set HEADLESS=0 to see the browser
@@ -58,7 +59,7 @@ async function inspectModalAndSave(page, tag = '') {
   } catch (e) { /* ignore */ }
 
   console.log('Saved modal debug files:', png, html);
-  console.log('Modal candidates found (selector, index, visible, text-snippet):\n', results);
+  console.log('Modal candidates found (selector, index, visible, text-snippet)'/* :\n', results */);
   return { png, html, modalSummaries: results };
 }
 
@@ -153,71 +154,71 @@ function extractNumberFromText(s) {
 
 
 async function safeGotoWith503Handling(page, url, opts = {}) {
-  const maxAttempts = opts.retries ?? 5;
-  const navTimeout = opts.navTimeout ?? 60000;
-  const waitSelector = opts.waitSelector ?? 'div[data-component-type="s-search-result"], .s-main-slot, #search';
-  const baseBackoffMs = opts.baseBackoffMs ?? 1500;
+  /*  
+    * - retries navigation up to maxAttempts
+    * - first tries waitUntil 'domcontentloaded', then 'load'
+    * - logs response status if available
+    * - on final failure saves screenshot and page HTML for debugging
+  */
+  const maxAttempts = opts.maxAttempts || 3;
+  const baseTimeout = opts.baseTimeout || 30000; // 30s default
+  const screenshotDir = opts.screenshotDir || path.join(process.cwd(), 'debug-screens');
+  if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir, { recursive: true });
+
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const timeout = Math.min(120000, baseTimeout * Math.pow(1.8, attempt-1)); // increasing timeout
     try {
-      console.log(`safeGoto attempt ${attempt} -> ${url}`);
-
-      // rotate UA and headers per attempt (helps avoid basic blocking heuristics)
-      const ua = randChoice(DEFAULT_USER_AGENTS);
-      try {
-        await page.context().setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9', 'user-agent': ua });
-      } catch (e) { /* ignore */ }
-      try { page.context().setDefaultNavigationTimeout(navTimeout); } catch (e) { /* ignore */ }
-
-      const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: navTimeout });
-
-      let status = null;
-      try { status = resp && typeof resp.status === 'function' ? resp.status() : (resp && resp.status) || null; } catch (e) { /* ignore */ }
-
-      console.log('Navigation response status:', status);
-
-      // If 5xx, treat as retryable
-      if (status && status >= 500 && status < 600) {
-        const backoff = baseBackoffMs * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 1000);
-        console.warn(`Got ${status} — retrying after ${backoff}ms (attempt ${attempt}/${maxAttempts})`);
-        await page.waitForTimeout(backoff);
-        continue; // next attempt
+      // console.log(`safeGoto attempt ${attempt} -> ${url}`);
+      
+      // try lightweight 'domcontentloaded' first (faster, often enough)
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+      if (response) {
+        const status = response.status();
+        console.log(`safeGoto attempt ${attempt} -> response status: ${status}`);
+      } else {
+        console.log(`safeGoto attempt ${attempt} -> no response object`);
       }
-
-      // Wait for meaningful content OR fallback timeout
+      // optionally wait for main content selector (reduce false positives)
       try {
-        await Promise.race([
-          page.waitForSelector(waitSelector, { timeout: 20000 }),
-          page.waitForTimeout(opts.postWaitTimeout ?? 10000)
-        ]);
-      } catch (e) {
-        // ignore - fallback allowed
+        await page.waitForSelector('div.s-main-slot, #search, main', { timeout: 5000 });
+      } catch (err) {
+        // not fatal — continue; we'll decide by response or content
       }
+    // if we got here, treat as success
+      return response || null;
 
-      // success — return response/status for caller if needed
-      return { resp, status };
     } catch (err) {
       console.warn(`safeGoto attempt ${attempt} failed: ${err.message}`);
+      
+      // small random backoff before next try
+      await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random()*1200)));
 
-      // final failure: capture debug artifacts
+      // final attempt fallback: try with waitUntil 'load'
       if (attempt === maxAttempts) {
-        const stamp = Date.now();
         try {
-          const png = `debug-goto-503-${stamp}.png`;
-          const html = `debug-goto-503-${stamp}.html`;
-          await page.screenshot({ path: png, fullPage: true }).catch(() => { });
-          const content = await page.content().catch(() => '<no-html>');
-          fs.writeFileSync(html, content);
-          console.warn('Wrote debug files:', png, html);
-        } catch (e) { console.warn('Could not write debug artifacts:', e.message); }
-        throw err;
-      }
-
-      // backoff before retrying
-      const backoff = baseBackoffMs * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 500);
-      await page.waitForTimeout(backoff);
+          console.log('Final attempt: trying waitUntil "load" with longer timeout...');
+          const response2 = await page.goto(url, { waitUntil: 'load', timeout: Math.min(120000, baseTimeout * 2) });
+          return response2 || null;
+        } catch (err2) {
+          // capture artifacts for debugging
+          const safeName = `failed-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+          const pngPath = path.join(screenshotDir, `${safeName}.png`);
+          const htmlPath = path.join(screenshotDir, `${safeName}.html`);
+          try {
+            await page.screenshot({ path: pngPath, fullPage: true });
+            const html = await page.content();
+            fs.writeFileSync(htmlPath, html);
+            console.error(`Navigation finally failed. Saved screenshot: ${pngPath} and HTML: ${htmlPath}`);
+          } catch (saveErr) {
+            console.error('Failed to save debug artifacts:', saveErr);
+          }
+          throw err2; // rethrow so upstream can handle/log
+        }
     }
   }
+  return null;
+} 
 }
 
 // remove known overlays or disable pointer events on them
@@ -401,7 +402,9 @@ async function handleTopRegionPopup(page) {
   }
 }
 
-// Call this after opening the modal to ensure it is closed via the "Continue" button.
+// Call this after you've opened the modal and want to ensure it is closed via the "Continue" button.
+// Relies on safeClick(page, locator) and removeOverlayIfPresent(page) helpers already in your script.
+
 async function waitForModalClosed(page, opts = {}) {
   const timeout = opts.timeout ?? 10000;
   const start = Date.now();
@@ -567,29 +570,171 @@ async function closeModalWithContinueEnhanced(page, opts = {}) {
   return false;
 }
 
-async function runPlaywrightFor(searchTerm) {
-  const browser = await chromium.launch({
-    headless: HEADLESS,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-setuid-sandbox'],
-  });
+// check #glow-ingress-line2 contains a zip code
+async function getGlowIngressText(page, timeout = 3000) {
+  const css = '#glow-ingress-line2';
+  const xpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
+  try {
+    // Prefer CSS, fallback to xpath
+    try {
+      await page.waitForSelector(css, { timeout });
+      let txt = await page.locator(css).innerText();
+      if (typeof txt === 'string') {
+        // remove invisible/zero-width and normalize whitespace
+        txt = txt.replace(/[\u200B-\u200F\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+        return txt;
+      }
+    } catch (e) {
+      // CSS not found in time — try xpath
+      const loc = page.locator(`xpath=${xpath}`);
+      if (await loc.count() > 0) {
+        let txt = await loc.first().innerText();
+        txt = txt.replace(/[\u200B-\u200F\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+        return txt;
+      }
+    }
+  } catch (e) {
+    return null;
+  }
+  return null;
+}
 
-  const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 900 },
-  });
-  const page = await context.newPage();
+
+async function glowHasZip(page, expectedZip = null, timeout = 3000) {
+  /**
+   * Waits for the glow ingress element and checks for a 5-digit ZIP code.
+   * - expectedZip (string) optional: if provided, the function returns true only if the found zip equals expectedZip.
+   * - timeout in ms to wait for the element (default 3000)
+   */
+  try {
+      const txt = await getGlowIngressText(page, timeout);
+      if (!txt) return false;
+      // Extract first 5-digit zip (allow optional +4 part)
+      const match = txt.match(/\b(\d{5})(?:-\d{4})?\b/);
+      if (!match) return false;
+      const zip = match[1];
+      if (expectedZip) return zip === String(expectedZip);
+      return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+
+async function zipVerify(page){
+  // ==================== ZIP VERIFICATION LOOP ====================
+  const MAX_ZIP_RETRIES = 3;
+  let zipConfirmed = false;
+
+  for (let zipAttempt = 0; zipAttempt < MAX_ZIP_RETRIES; zipAttempt++) {
+    console.log(`ZIP verification attempt ${zipAttempt + 1}/${MAX_ZIP_RETRIES}...`);
+    
+    await page.waitForTimeout(1000);
+    
+    const glowText = await getGlowIngressText(page, 3000);
+    console.log(`Glow ingress text: "${glowText}"`);
+    
+    const hasZip10022 = await glowHasZip(page, '10022', 3000);
+    
+    if (hasZip10022) {
+      console.log(`✅ ZIP 10022 confirmed in header — safe to scrape.`);
+      zipConfirmed = true;
+      break; // Success! Exit loop
+    } else {
+      console.warn(`⚠️ ZIP 10022 not in header (attempt ${zipAttempt + 1}/${MAX_ZIP_RETRIES})`);
+      
+      // Not the last attempt? Try again
+      if (zipAttempt < MAX_ZIP_RETRIES - 1) {
+        console.log(`Retrying ZIP submission...`);
+        
+        // Re-open modal by clicking deliver-to
+        const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
+        const deliver = page.locator(`xpath=${deliverToXpath}`);
+        
+        if (await deliver.count() > 0) {
+          await removeOverlayIfPresent(page);
+          await safeClick(page, deliver, { timeout: 5000 });
+          await page.waitForTimeout(1000);
+          
+          // Find and fill ZIP
+          const zipResult = await findZipInputAcrossFrames(page);
+          
+          if (zipResult && zipResult.locator) {
+            console.log(`Found ZIP input on retry, filling...`);
+            await zipResult.locator.fill('10022');
+            await zipResult.locator.press('Enter');
+            await page.waitForTimeout(600);
+            
+            // Close modal
+            const closed = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
+            if (closed) {
+              console.log(`Modal closed on retry`);
+              await page.waitForTimeout(500);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!zipConfirmed) {
+    console.warn(`⚠️ Failed to confirm ZIP after ${MAX_ZIP_RETRIES} attempts.`);
+    console.warn(`Proceeding with scraping anyway (results may not be accurate)...`);
+    // Optional: return [] to abort if ZIP not set
+  }
+  // ==================== END ZIP VERIFICATION LOOP ====================
+}
+
+
+async function runPlaywrightFor(searchTerm,  opts = {}) {
+  const externallyProvidedPage = !!opts.page;
+  let browser = opts.browser;
+  let context = opts.context;
+  let page = opts.page;
+
+
+  if (!externallyProvidedPage) {
+    // create isolated browser/context/page if not provided
+    if (!browser) {
+      browser = await chromium.launch({ headless: true });
+      // note: if you create a browser here you should close it in finally; prefer providing sharedBrowser from caller
+    }
+    context = await browser.newContext();
+
+    page = await context.newPage({
+        // Before navigation set user agent on the page
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    });
+  }
+
+  const taskId = opts.taskId ?? 'local';
+  console.log(`[${taskId}] runPlaywrightFor start:`, searchTerm);
+
 
   try {
-    // Build search URL
-     const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&i=fashion&rh=n%3A7141123011%2Cn%3A7147445011%2Cn%3A12035955011%2Cn%3A9103696011%2Cp_6%3AATVPDKIKX0DER&s=exact-aware-popularity-rank&dc&crid=32KWX5YSMPKFS&qid=1769802877&rnid=12035955011&sprefix=${encodeURIComponent(searchTerm)}%2Cfashion%2C1382&ref=sr_st_exact-aware-popularity-rank&ds=v1%3Aj3gHDOxV25aXkkzkP3BVzm%2FKIALNeMjnRSV99ITAu1E`;
-    console.log('Navigating to:', searchUrl);
+    // strictly use the local `page` variable only
+    const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&i=fashion&rh=n%3A7141123011%2Cn%3A7147445011%2Cn%3A12035955011%2Cn%3A9103696011%2Cp_6%3AATVPDKIKX0DER&s=exact-aware-popularity-rank&dc&crid=32KWX5YSMPKFS&qid=1769802877&rnid=12035955011&sprefix=${encodeURIComponent(searchTerm)}%2Cfashion%2C1382&ref=sr_st_exact-aware-popularity-rank&ds=v1%3Aj3gHDOxV25aXkkzkP3BVzm%2FKIALNeMjnRSV99ITAu1E`;
+    // Before navigation set headers on the page
+    await page.setExtraHTTPHeaders({
+      'accept-language': 'en-US,en;q=0.9'
+    });
+    page.setDefaultNavigationTimeout(60000); // 60s
+    page.setDefaultTimeout(45000);
 
-    // Use safe goto with retry/backoff
-    const { resp, status } = await safeGotoWith503Handling(page, searchUrl, { retries: 4, navTimeout: 90000 });
-    if (status === 503) {
-      console.warn('Final navigation returned 503 — check debug-goto-503-*.png/.html');
-      // We continue but you may want to abort depending on your workflow
+    // strictly use the local `page` variable only
+    const response = await page.goto(searchUrl);
+    console.log('Navigating to searchUrl' /* :', searchUrl */);
+    
+    if (!response) {
+      console.warn(`[${taskId}] safeGoto returned null (no response) for ${searchTerm}`);
+      return [];
+    }
+    // Check HTTP status if response available
+    const resStatus = response.status ? response.status() : null;
+    if (resStatus && resStatus >= 400) {
+      console.warn(`[${taskId}] navigation returned status ${status} for ${url}`);
+      // decide whether to continue or return empty
+      return [];
     }
 
     console.log('Attempting to Enter US Zip');
@@ -600,6 +745,7 @@ async function runPlaywrightFor(searchTerm) {
     await modalLocator.waitFor({ timeout: 8000 }).catch( async() => {
       // If modal didn't appear, try a bit longer and retry Deliver-to click once
       console.log('Location modal not detected quickly — retrying Deliver-to click and waiting');
+
       await handleTopRegionPopup(page);
 
       const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
@@ -613,15 +759,17 @@ async function runPlaywrightFor(searchTerm) {
     });
 
     // Now modalLocator should represent the modal; take a scoped screenshot for debugging
+    let zipHandled = false;
     try {
-      // after opening the modal and waiting a bit:
+        // after opening the modal and waiting a bit:
         await page.waitForTimeout(800);
         const debug = await inspectModalAndSave(page, 'after-open'); // optional: helpful
         const zipResult = await findZipInputAcrossFrames(page);
+
         if (!zipResult) {
           // --- handle "Change Address" button and retry ZIP detection ---
           try {
-             // Try to click the "Change Address" button inside the modal
+            // Try to click the "Change Address" button inside the modal
             const changeAddressBtn = page.locator('.a-spacing-top-base:has-text("Change Address")');
 
             if (await changeAddressBtn.count() > 0) {
@@ -672,16 +820,16 @@ async function runPlaywrightFor(searchTerm) {
                 const ok = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
                 if (!ok) {
                   console.warn('Could not close modal via Continue — skipping ZIP and proceeding to scrape (or abort).');
-                  // decide: skip ZIP, or abort run, or try a different flow
                 } else {
-                  // modal closed — safe to start scraping
-                  await page.waitForTimeout(300); // small buffer
+                  console.log('Modal closed successfully after ZIP submission');
+                  zipHandled = true;
+                  await page.waitForTimeout(300);
                 }
-
-                // Wait briefly for modal to react and search results to appear (if modal closes)
-                await page.waitForTimeout(1100);
+                 // Wait briefly for search results to appear
                 await waitForSearchResultsOrTimeout(page, 8000);
                 console.log('ZIP submit attempted; continue with scraping.');
+                // Verify zip is set, after modal closed and before scraping
+                await zipVerify(page);
               } else {
                 console.log('Still no ZIP input after clicking Change Address. Skipping ZIP step (modal may require sign-in).');
               }
@@ -694,37 +842,45 @@ async function runPlaywrightFor(searchTerm) {
             try { fs.writeFileSync(`debug-change-address-fail-${stamp}.html`, await page.content()); } catch(e){}
             console.warn('Error handling Change Address (saved debug). Error:', err.message);
           }
-          console.log('No ZIP input found (modal may require sign-in or be different). Skipping ZIP step.');
-          // optionally bail out of modal flow and continue scraping without ZIP
+          if (!zipHandled) {
+            console.log('No ZIP input found (modal may require sign-in or be different). Skipping ZIP step.');
+          }
         } else {
           console.log('Found ZIP input in frame, selector:', zipResult.selector);
-          const { frame, locator } = zipResult; // locator is Playwright Locator bound to the frame
-          // fill and submit: press enter, or safe click apply, etc.
-          await locator.fill('10022').catch(() => {});
-          console.log('Filled Zip 10022');
-          await locator.press('Enter').catch(() => {});
-          console.log('Pressed Enter to Apply');
-          await locator.press('Enter').catch(() => {});
-          console.log('Pressed Enter to Continue');
+          const { frame, locator } = zipResult;
+          
+          try {
+            await locator.fill('10022');
+            console.log('Filled Zip 10022');
+            await locator.press('Enter');
+            console.log('Pressed Enter to Apply');
 
-          // after opening modal and short wait:
-          await page.waitForTimeout(600);
-          const ok = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
-          if (!ok) {
-            console.warn('Could not close modal via Continue — skipping ZIP and proceeding to scrape (or abort).');
-            // decide: skip ZIP, or abort run, or try a different flow
-          } else {
-            // modal closed — safe to start scraping
-            await page.waitForTimeout(300); // small buffer
-            
+            await page.waitForTimeout(600);
+            const ok = await closeModalWithContinueEnhanced(page, { timeout: 15000 });
+            if (!ok) {
+              console.warn('Could not close modal via Continue — skipping ZIP and proceeding to scrape.');
+            } else {
+              console.log('Modal closed successfully after ZIP submission');
+              zipHandled = true;
+              await page.waitForTimeout(300);
+            }
+          } catch (e) {
+            console.warn('ZIP submission failed:', e.message);
           }
         }
-        } catch(e){ /* ignore */ }
+        } catch(e){ 
+      console.warn('Modal handling error:', e.message);
+    }
+
+    // Verify zip is set, after modal closed and before scraping
+    await zipVerify(page);
+   
 
     // Final: wait for actual search results to appear (no strict networkidle)
     await waitForSearchResultsOrTimeout(page, 30000);
     await page.waitForTimeout(800);
-    
+
+
     // Wait a little for results to reload after sorting/ZIP change
     await sleep(1200);
 
@@ -748,6 +904,7 @@ async function runPlaywrightFor(searchTerm) {
       }
 
     const scraped = [];
+    const seenLinks = new Set(); // Track unique product links
 
     for (let i = 0; i < available; i++) {
       const r = resultsLocator.nth(i);
@@ -762,6 +919,13 @@ async function runPlaywrightFor(searchTerm) {
       let link = await trySelectorsAttr(r, ['h2 a', 'a.a-link-normal.s-no-outline'], 'href');
       if (link && link.startsWith('/')) link = AMAZON_BASE + link;
       if (link && !link.startsWith('http')) link = AMAZON_BASE + '/' + link;
+
+      // Skip duplicates based on link
+      if (link && seenLinks.has(link)) {
+        console.log(`Skipping duplicate product at position ${i + 1}: ${link}`);
+        continue;
+      }
+      if (link) seenLinks.add(link);
 
       // Image
       let image = await trySelectorsAttr(r, ['img.s-image', 'img'], 'src');
@@ -801,8 +965,7 @@ async function runPlaywrightFor(searchTerm) {
           reviewCountFormatted = null;
         }
       }
-
-      console.log('rawReviewCount:', rawReviewCount, '->', reviewCountValue, reviewCountFormatted);
+      // console.log(`[${i + 1}] rawReviewCount: (${rawReviewCount}) ->`, reviewCountValue, reviewCountFormatted);
 
       // Price
       const price = await trySelectorsText(r, [
@@ -820,15 +983,19 @@ async function runPlaywrightFor(searchTerm) {
         price: price || null,
       });
     }
-
-    console.log('Scrape result:', JSON.stringify(scraped, null, 2));
+    console.log(`[${taskId}] scraped ${scraped.length} unique items for`, searchTerm);
     return scraped;
   } catch (err) {
-    console.error('Fatal error in playwright flow:', err);
-    throw err;
+    console.error(`[${taskId}] scrape error for ${searchTerm}:`, err);
+    return [];
   } finally {
-    await context.close();
-    await browser.close();
+    // close only what we created
+    if (!externallyProvidedPage) {
+      try { await context.close(); } catch (e) {}
+      if (!opts.browser) {
+        try { await browser.close(); } catch (e) {}
+      }
+    }
   }
 }
 
