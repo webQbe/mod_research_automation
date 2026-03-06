@@ -3,6 +3,8 @@ const express = require('express');
 const fetch = global.fetch || require('node-fetch'); // node <18 fallback
 const { runPlaywrightFor } = require('./amazon-scrape'); // your existing scraper
 const { buildSearchTerm } = require('./search-term');
+const { sendScrapedResultInChunks } = require('./chunk-forward');
+const { chromium } = require('playwright'); // or import from your existing setup
 
 const PORT = process.env.PORT || 8080;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || ''; // optional for forwarding
@@ -63,47 +65,110 @@ app.post('/api/run-scrape', async (req, res) => {
     const searchTerm = buildSearchTerm(main_niche, sub_niche);
     console.log('Built searchTerm:', searchTerm);
 
-    // run your scraper
-    const scraped = await runPlaywrightFor(searchTerm);
-    const scrapeResult = Array.isArray(scraped) ? scraped : [];
+    // Respond immediately with accepted status
+    res.json({ 
+      ok: true, 
+      accepted: 1, 
+      searchTerm,
+      message: 'Scraping started' 
+    });
 
-    // forward to webhook (your Apps Script)
-    if (WEBHOOK_URL) {
-      // ensure keywords is always a plain string for the webhook
-      const keywordsForWebhook = Array.isArray(keywords)
-        ? keywords.join(', ')
-        : (keywords === undefined || keywords === null ? '' : String(keywords));
+    // Process asynchronously after responding
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`Starting scrape: ${searchTerm}`);
+    console.log(`${'='.repeat(60)}\n`);
 
-      const webhookPayload = {
+    // Launch browser
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    let taskResult = { searchTerm, success: false };
+
+    try {
+      // Run scraper
+      const scraped = await runPlaywrightFor(searchTerm, { 
+        page, 
+        context, 
+        browser, 
+        taskId: 'single' 
+      });
+      
+      const scrapeResult = Array.isArray(scraped) ? scraped : [];
+      console.log(`✓ Scraped ${scrapeResult.length} results`);
+
+      // Forward to webhook if configured
+      if (WEBHOOK_URL) {
+        // Ensure keywords is a plain string for webhook
+        const keywordsForWebhook = Array.isArray(keywords)
+          ? keywords.join(', ')
+          : (keywords === undefined || keywords === null ? '' : String(keywords));
+
+        const webhookPayload = {
           token: WEBHOOK_TOKEN,
           main_niche,
           sub_niche,
           keywords: keywordsForWebhook,
           search_term: searchTerm,
-          scrapeResult
-      };
-    try {
-          const webhookResp = await fetch(WEBHOOK_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(webhookPayload)
-          });
+          scrapeResult,
+          clientId: 'single'
+        };
 
-          const text = await webhookResp.text();
-          console.log('Webhook payload keywords (type):', typeof keywordsForWebhook, keywordsForWebhook);
-          console.log('Forwarded to webhook, status:', webhookResp.status);
-          console.log('Webhook body (preview):', text.slice(0,2000));
-          return res.json({ ok: true, forwarded: true, webhookStatus: webhookResp.status, scrapedCount: scrapeResult.length });
-        } catch(err) {
-          console.error("Webhook forwarding failed:", err.message);
-          console.log("Url:", WEBHOOK_URL);
+        console.log('Webhook payload keywords (type):', typeof keywordsForWebhook, keywordsForWebhook);
+        console.log('Forwarding to webhook...');
+
+        // ✅ Use the chunked forwarding function
+        const forwardResp = await sendScrapedResultInChunks(webhookPayload);
+        
+        if (!forwardResp || !forwardResp.ok) {
+          console.log(`❌ Webhook forward failed`, forwardResp);
+          taskResult.success = false;
+          taskResult.error = forwardResp?.error || 'Webhook forward failed';
+          taskResult.webhookStatus = forwardResp?.status;
+        } else {
+          console.log(`✅ All chunks forwarded successfully`);
+          taskResult.success = true;
+          taskResult.webhookStatus = forwardResp.status;
+          taskResult.webhookData = forwardResp.data;
+        }
+        
+        taskResult.scrapedCount = scrapeResult.length;
+      } else {
+        // No webhook configured
+        console.log('No webhook URL configured, scrape complete');
+        taskResult.success = true;
+        taskResult.scrapedCount = scrapeResult.length;
       }
+
+    } catch (err) {
+      console.error('❌ Scrape error:', err.message);
+      taskResult.error = err.message;
+      taskResult.success = false;
+    } finally {
+      await context.close();
+      await browser.close();
     }
-    // otherwise return the scraped result directly
-    res.json({ ok: true, forwarded: false, scrapedCount: scrapeResult.length, scrapeResult });
+
+    // Final summary
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`SCRAPE COMPLETE`);
+    console.log(`${'='.repeat(60)}`);
+    console.log(`Search term: ${searchTerm}`);
+    console.log(`Status: ${taskResult.success ? '✅ Success' : '❌ Failed'}`);
+    if (taskResult.scrapedCount !== undefined) {
+      console.log(`Scraped: ${taskResult.scrapedCount} items`);
+    }
+    if (taskResult.webhookStatus) {
+      console.log(`Webhook: HTTP ${taskResult.webhookStatus}`);
+    }
+    if (taskResult.error) {
+      console.log(`Error: ${taskResult.error}`);
+    }
+    console.log(`${'='.repeat(60)}\n`);
+
   } catch (err) {
     console.error('run-scrape error:', err);
-    res.status(500).json({ ok: false, error: String(err) });
+    // Response already sent, just log the error
   }
 });
 

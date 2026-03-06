@@ -39,9 +39,14 @@ const SPREADSHEET_ID = 'google_sheet_id';
   SPREADSHEET_ID=google_sheet_id
   SHEET_NAME=raw_data
   PORT=8080
+  BULK_PORT=3001
   WEBHOOK_URL=webhook_appsscript_url
   WEBHOOK_TOKEN=supersecret123
   MAX_ZIP_RETRIES=5
+  CLIENT_TOKEN=''
+  PLAYWRIGHT_CONCURRENCY=2
+  FORWARD_MAX_BATCH=5
+  FORWARD_CONCURRENCY=2
   ```
 
 #### `data-receiver/` module
