@@ -3,6 +3,118 @@ function log(msg) {
   appendExportLog(msg);
 }
 
+/**
+ * Mark duplicate rows in the "results" sheet by ASIN found in the link column (col D).
+ * Keeps the row with the lowest numeric rank (col B) and writes "DUPLICATE" into column J (notes)
+ * for the other duplicate rows.
+ *
+ * Behavior/details:
+ * - Header is expected in row 1.
+ * - Sheet name: "results".
+ * - Columns (1-based): A parent_id, B rank, C title, D link, E price, F review_count, G notes (will be modified), ...
+ * - ASIN is matched by the pattern "/dp/ASIN" (standard 10-char ASIN). Adjust regex if you need to support other patterns.
+ * - If a notes cell already contains text, "DUPLICATE" will be appended (separated by " | ") unless "DUPLICATE" is already present.
+ * - Rows without a matching ASIN are left unchanged.
+ */
+function dedupeResultsByASINMark() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('results');
+  if (!sheet) {
+    log('Sheet "results" not found.');
+    return;
+  }
+
+  const HEADER_ROWS = 1;
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= HEADER_ROWS) {
+    log('No data rows to process.');
+    return;
+  }
+
+  const lastCol = sheet.getLastColumn();
+  const dataRange = sheet.getRange(HEADER_ROWS + 1, 1, lastRow - HEADER_ROWS, lastCol);
+  const values = dataRange.getValues(); // 2D array of rows
+
+  // Regex to match ASIN after "/dp/". ASINs are typically 10 alphanumeric chars.
+  const asinRegex = /\/dp\/([A-Za-z0-9]{10})/i;
+
+  // Map asin -> { bestIndex: data-array-index, bestRank: number }
+  const asinMap = {};
+  const rowsToMark = [];
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+
+    // rank is column B -> index 1
+    let rawRank = row[1];
+    let rank = Number.POSITIVE_INFINITY;
+    if (typeof rawRank === 'number' && !isNaN(rawRank)) {
+      rank = rawRank;
+    } else if (rawRank != null && String(rawRank).trim() !== '') {
+      const parsed = parseFloat(String(rawRank).replace(/[^\d.\-]/g, ''));
+      if (!isNaN(parsed)) rank = parsed;
+    }
+
+    // link is column D -> index 3
+    const link = row[3] ? String(row[3]) : '';
+    const m = link.match(asinRegex);
+    if (!m) {
+      // no ASIN -> skip
+      continue;
+    }
+    const asin = m[1].toUpperCase();
+
+    if (!(asin in asinMap)) {
+      asinMap[asin] = { bestIndex: i, bestRank: rank };
+    } else {
+      const existing = asinMap[asin];
+      if (rank < existing.bestRank) {
+        // current row is better (lower rank). Mark previous best for marking,
+        // and update map to keep current row as best.
+        rowsToMark.push(HEADER_ROWS + 1 + existing.bestIndex);
+        asinMap[asin] = { bestIndex: i, bestRank: rank };
+      } else {
+        // current row is worse (or equal) -> mark current for marking
+        rowsToMark.push(HEADER_ROWS + 1 + i);
+      }
+    }
+  }
+
+  if (rowsToMark.length === 0) {
+    log('No duplicates found by ASIN.');
+    return 0;
+  }
+
+  // Convert to a set of 0-based data-array indices for easier updates
+  const markRowNumsSet = new Set(rowsToMark.map(r => r - (HEADER_ROWS + 1))); // indices into values[]
+
+  // Prepare notes column updates (column J = 10)
+  const notesColIndex = 9; // zero-based index in values[] (A=0 -> G=9)
+  const notesUpdates = [];
+
+  for (let i = 0; i < values.length; i++) {
+    let currentNote = values[i][notesColIndex];
+    if (currentNote == null) currentNote = '';
+    else currentNote = String(currentNote);
+
+    if (markRowNumsSet.has(i)) {
+      // If note already contains DUPLICATE (case-insensitive), do nothing; otherwise append or set.
+      if (!/DUPLICATE/i.test(currentNote)) {
+        currentNote = currentNote.trim() === '' ? 'DUPLICATE' : (currentNote + ' | DUPLICATE');
+      }
+    }
+    notesUpdates.push([currentNote]); // must be 2D array for setValues
+  }
+
+  // Write notes back in one bulk operation to column J rows (HEADER_ROWS+1 .. lastRow)
+  const notesRange = sheet.getRange(HEADER_ROWS + 1, notesColIndex + 1, notesUpdates.length, 1);
+  notesRange.setValues(notesUpdates);
+
+  log('Marked ' + markRowNumsSet.size + ' duplicate rows by ASIN (wrote to column J).');
+  return markRowNumsSet.size;
+}
+
+
 function appendExportLog(msg) {
   try {
     const ss = SpreadsheetApp.openById(spreadsheetId);
