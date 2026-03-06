@@ -6,7 +6,6 @@ const { screenshotFilePath } = require('./fileHelper');
 const logger = require('./logger');
 const { dedupeResults } = require('./dedupe-by-image'); // adjust path as needed
 
-const MAX_RESULTS = 5;
 const AMAZON_BASE = 'https://www.amazon.com';
 
 function randChoice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
@@ -518,7 +517,7 @@ async function glowHasZip(page, expectedZip = null, timeout = 3000) {
 
 async function zipVerify(page){
   // ==================== ZIP VERIFICATION LOOP ====================
-  const MAX_ZIP_RETRIES = 3;
+  const MAX_ZIP_RETRIES = 5;
   let zipConfirmed = false;
 
   for (let zipAttempt = 0; zipAttempt < MAX_ZIP_RETRIES; zipAttempt++) {
@@ -645,6 +644,151 @@ async function safeGoto(page, url, opts = {}) {
   return null;
 }
 
+// robust wait helper for Amazon location modal
+async function waitForAmazonLocationModal(page, { initialTimeout = 8000, retryTimeout = 9000, maxIndex = 22 } = {}) {
+  const logger = console; // replace with your logger if you have one
+
+  // 1) Try the index-based xpath scanning (common on Amazon: modal gets high index)
+  async function scanIndexRange(timeoutPerCandidate = 1000) {
+    for (let i = 5; i <= Math.min(maxIndex, 40); i++) {
+      const xpath = `/html/body/div[${i}]/div`;
+      const loc = page.locator(`xpath=${xpath}`);
+      try {
+        if (await loc.count() > 0) {
+          // wait slightly for visibility
+          await loc.waitFor({ state: 'visible', timeout: timeoutPerCandidate });
+          logger.info(`Found modal at xpath ${xpath}`);
+          return loc;
+        }
+      } catch (err) {
+        // ignore and continue scanning
+      }
+    }
+    return null;
+  }
+
+  // 2) Try role-based and semantic selectors (preferred when available)
+  async function trySemanticSelectors(tout = 2000) {
+    // role=dialog (Playwright supports getByRole)
+    try {
+      const dlg = page.getByRole ? page.getByRole('dialog').first() : page.locator(`xpath=//div[@role="dialog"]`).first();
+      if (dlg && await dlg.count() > 0) {
+        await dlg.waitFor({ state: 'visible', timeout: tout });
+        logger.info('Found modal via role=dialog');
+        return dlg;
+      }
+    } catch (err) {}
+
+    // fallback: look for a top-level div that contains likely modal text (deliver, address, zip)
+    try {
+      const textCandidates = ['Delivery options', 'Choose a delivery', 'Select a delivery address', 'Choose your location', 'Select a shipping address'];
+      for (const t of textCandidates) {
+        const loc = page.locator(`xpath=//div[contains(normalize-space(.), "${t}")]`).first();
+        if (loc && await loc.count() > 0) {
+          await loc.waitFor({ state: 'visible', timeout: tout });
+          logger.info(`Found modal via contains text "${t}"`);
+          return loc;
+        }
+      }
+    } catch (err) {}
+    return null;
+  }
+
+  // 3) Try scanning all top-level body divs and pick the first visible one that looks like a modal (heuristic)
+  async function heuristicTopLevelScan(timeoutPerCandidate = 500) {
+    try {
+      const nodes = await page.$$('xpath=/html/body/div');
+      for (let idx = 0; idx < Math.min(nodes.length, maxIndex); idx++) {
+        const i = idx + 1;
+        const loc = page.locator(`xpath=/html/body/div[${i}]`);
+        try {
+          await loc.waitFor({ state: 'visible', timeout: timeoutPerCandidate });
+          // heuristics: modal often has a child with role, button, or large content
+          const text = (await loc.textContent() || '').slice(0, 300);
+          if (text && (text.match(/shipping|address|zipcode|postal/i) || (await loc.locator('button').count() > 0))) {
+            logger.info(`Heuristic found visible top-level div at index ${i}`);
+            return loc;
+          }
+        } catch (err) { /* not visible or timed out  */ }
+      }
+    } catch (err) {}
+    return null;
+  }
+
+  // MAIN FLOW: try quick attempts then retry after clicking Deliver-to & handling overlays
+  // 1st pass (fast)
+  let modal = null;
+  try {
+    modal = await Promise.race([
+      scanIndexRange(800),
+      trySemanticSelectors(1200),
+      heuristicTopLevelScan(400)
+    ]);
+    if (modal) return modal;
+  } catch (err) {
+    // continue to retry logic below
+  }
+
+  // If we reach here, nothing found quickly -> retry: click Deliver-to, remove overlays, try again
+  logger.info('Location modal not detected quickly — retrying Deliver-to click and waiting');
+
+  try {
+    // re-run your top-region popup handler if present
+    if (typeof handleTopRegionPopup === 'function') {
+      await handleTopRegionPopup(page).catch(() => {});
+    }
+
+    // try clicking Deliver-to element if present
+    const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
+    const deliver = page.locator(`xpath=${deliverToXpath}`);
+    if (await deliver.count() > 0) {
+      if (typeof removeOverlayIfPresent === 'function') await removeOverlayIfPresent(page).catch(()=>{});
+      await safeClick(page, deliver, { timeout: 5000 }).catch(()=>{});
+      // give the page a bit to create the modal
+      await page.waitForTimeout(350);
+    }
+  } catch (err) {
+    logger.warn('Error during retry Deliver-to click:', err.message || err);
+  }
+
+  // emit debug artifacts before the retry search (keeps your existing debug ops)
+  try {
+    const stamp = Date.now();
+    const png = `debug-modalLocator-${stamp}.png`;
+    const html = `debug-modalLocator-${stamp}.html`;
+    await page.screenshot({ path: png, fullPage: true }).catch(()=>{});
+    const content = await page.content().catch(()=>'<no-html>');
+    require('fs').writeFileSync(html, content);
+    logger.warn('[modalLocator] Wrote debug files:', png, html);
+  } catch (err) {
+    logger.warn('[modalLocator] Could not write debug artifacts:', err.message);
+  }
+
+  // 2nd pass (longer)
+  try {
+    modal = await Promise.race([
+      scanIndexRange(1200),
+      trySemanticSelectors(2000),
+      heuristicTopLevelScan(800)
+    ]);
+    if (modal) return modal;
+  } catch (err) {}
+
+  // ultimate fallback: try Playwright API directly searching for dialog role
+  try {
+    const dlg = page.locator(`xpath=//div[@role="dialog"]`).first();
+    if (dlg && await dlg.count() > 0) {
+      await dlg.waitFor({ state: 'visible', timeout: retryTimeout }).catch(()=>{});
+      logger.info('Fallback found dialog via xpath //div[@role="dialog"]');
+      return dlg;
+    }
+  } catch (err) {}
+
+  // nothing found — return null so caller can continue gracefully
+  logger.info('No location modal detected after retries');
+  return null;
+}
+
 
 async function runPlaywrightFor(searchTerm,  opts = {}) {
   const externallyProvidedPage = !!opts.page;
@@ -670,8 +814,8 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
   const taskId = opts.taskId ?? 'local';
   logger.log(`[${taskId}] runPlaywrightFor start:`, searchTerm);
 
-  const maxResults = Number(opts.maxResults || 10);
-  const targetUniqueCount = Number(opts.targetUniqueCount || 5);
+  const maxResults = Number(opts.maxResults || 52);
+  const targetUniqueCount = maxResults /* Number(opts.targetUniqueCount || 9) */;
 
   if (!page) {
     throw new Error('runPlaywrightFor requires opts.page (a Playwright Page).');
@@ -679,7 +823,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
 
   try {
     // strictly use the local `page` variable only
-    const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&i=fashion-novelty&rh=n%3A9103696011%2Cp_6%3AATVPDKIKX0DER&s=relevancerank&dc&qid=1770902095&rnid=2661622011&ref=sr_nr_p_6_1&ds=v1%3AlWj3BQdPmGzUzm8rpSf5mBoXxUpp28tJW2GjPrv9h3M`;
+    const searchUrl = `${AMAZON_BASE}/s?k=${encodeURIComponent(searchTerm)}&i=fashion-novelty&rh=n%3A7147445011%2Cp_6%3AATVPDKIKX0DER&s=review-rank&dc&crid=1WROLBEY3M3HE&qid=1772027461&refresh=1&rnid=2661622011&sprefix=${encodeURIComponent(searchTerm)}%2Cfashion-novelty%2C549&ref=sr_st_review-rank&ds=v1%3ATdzw0sGIfMiGvl4yIBBpl%2ByOmAlhDgvxsucMqLHEv0w`;
 
     console.log(`[${taskId}] runPlaywrightFor start: "${searchTerm}" maxResults=${maxResults} targetUnique=${targetUniqueCount}`);
 
@@ -690,7 +834,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     page.setDefaultNavigationTimeout(60000); // 60s
     page.setDefaultTimeout(45000);
 
-    logger.info(`[${taskId}] Navigating to searchUrl` /* :', searchUrl */);
+    logger.log(`[${taskId}] Navigating to searchUrl` /* :', searchUrl */);
     
     // safe goto (uses retries + artifact capture on failure)
     const navResp = await safeGoto(page, searchUrl, { maxAttempts: 3, baseTimeout: 30000 });
@@ -702,7 +846,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     // Check HTTP status if response available
     const resStatus = navResp.status ? navResp.status() : null;
     if (resStatus && resStatus >= 400) {
-      logger.log(`[${taskId}] navigation returned status ${resStatus} for ${url}`);
+      logger.log(`[${taskId}] navigation returned status ${resStatus} for ${searchUrl}`);
       // decide whether to continue or return empty
       return [];
     }
@@ -710,23 +854,16 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     logger.info('Attempting to Enter US Zip');
 
     // Wait for the location modal to appear (use the modal xpath that Amazon uses)
-    const modalLocator = page.locator(`xpath=/html/body/div[5]`);
+    const modalLocator = await waitForAmazonLocationModal(page, { initialTimeout: 8000, retryTimeout: 9000 });
 
-    await modalLocator.waitFor({ timeout: 8000 }).catch( async() => {
-      // If modal didn't appear, try a bit longer and retry Deliver-to click once
-      logger.info('Location modal not detected quickly — retrying Deliver-to click and waiting');
-      
-      await handleTopRegionPopup(page);
-      
-      const deliverToXpath = '/html/body/div[1]/header/div/div[1]/div[1]/div[2]/span/a/div[2]/span[2]';
-      const deliver = page.locator(`xpath=${deliverToXpath}`);
-      if (await deliver.count() > 0) {
-        await removeOverlayIfPresent(page);
-        await safeClick(page, deliver, { timeout: 5000 }).catch(()=>{});
-      }
-
-      return modalLocator.waitFor({ timeout: 9000 });
-    });
+    if (modalLocator) {
+      // proceed with modal interactions
+      await modalLocator.click().catch(()=>{});
+      // or use modalLocator.locator(...) to find buttons/inputs inside
+    } else {
+      // modal not present — continue gracefully
+      logger.info('Proceeding without location modal (not present)');
+    }
 
     // Now modalLocator should represent the modal; take a scoped screenshot for debugging
     let zipHandled = false;
@@ -860,7 +997,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
     // ---------- Scrape top N organic search results ----------
     const resultsLocator = page.locator('div[data-component-type="s-search-result"]');
     const count = await resultsLocator.count();
-    const available = Math.min(count, MAX_RESULTS);
+    const available = Math.min(count, maxResults);
     logger.info(`Found ${count} results on page; scraping top ${available}`);
 
     // Take a page screenshot of loaded results for debugging
@@ -937,7 +1074,12 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
           reviewCountFormatted = null;
         }
       }
-          
+
+       // ✅ DEBUG: Log what we extracted
+      if (scrapedResults.length < 3) {
+        console.log(`[${taskId}] Item ${i}: rawReviewCount="${rawReviewCount}" → parsed=${reviewCountValue}`);
+      }
+              
       // Price
       const price = await trySelectorsText(r, [
         'span.a-price > span.a-offscreen',
@@ -951,6 +1093,7 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
           link,
           image,
           price,
+          reviewCount: reviewCountValue,  // ✅ Use numeric value with correct name
           reviewCountFormatted,
           rank: scrapedResults.length + 1,
           capturedAt: new Date().toISOString()
@@ -959,12 +1102,60 @@ async function runPlaywrightFor(searchTerm,  opts = {}) {
 
    console.log(`[${taskId}] scraped ${scrapedResults.length} items from first page`);
 
-  // Dedupe by image similarity
-  const { unique } = await dedupeResults(scrapedResults, { concurrency: 6, threshold: 3, keep: 'first' });
-  console.log(`[${taskId}] after deduplication: total scraped=${scrapedResults.length}, uniqueImages=${unique.length}`);
+    // ✅ DEBUG: Show first 3 items with their review counts
+    if (scrapedResults.length > 0) {
+      console.log(`[${taskId}] Sample of scraped items:`);
+      scrapedResults.slice(0, 3).forEach((item, idx) => {
+        console.log(`[${idx}] ASIN=${item.asin} reviews=${item.reviewCount}(${item.reviewCountFormatted})`);
+      });
+    }
 
-  // Return up to targetUniqueCount unique results
-  const finalResults = unique.slice(0, targetUniqueCount);
+   // -------------------
+    // Post-processing per your requested steps:
+    // 1) scrape up to maxResults (done)
+    // 2) filter out reviewCount < 5
+    // 3) for same reviewCount keep only the top-most (first seen)
+    // 4) sort unique results (up to maxResults) by reviewCount desc
+    // -------------------
+
+    // Step 2: filter out low review counts and items without numeric review count
+    const minReviews = 5;
+    const filtered = scrapedResults.filter(it => {
+      return it.reviewCount !== null && Number.isFinite(it.reviewCount) && it.reviewCount >= minReviews;
+    });
+
+    logger.info(`[${taskId}] after review-count filter (>=${minReviews}): ${filtered.length} items`);
+
+    // Step 3: keep only the top-most item per reviewCount value (first seen wins)
+    const seenReviewCounts = new Map();
+    const topMostPerReview = [];
+    for (const item of filtered) {
+      const rc = item.reviewCount;
+      if (!seenReviewCounts.has(rc)) {
+        seenReviewCounts.set(rc, true);
+        topMostPerReview.push(item);
+      }
+    }
+
+    logger.info(`[${taskId}] after collapsing same review-count values: ${topMostPerReview.length} items`);
+
+    // Step 4: sort by reviewCount descending and cap to maxResults
+    topMostPerReview.sort((a, b) => {
+      // fallback to 0 if missing (shouldn't be), keep stable ordering otherwise
+      return (b.reviewCount || 0) - (a.reviewCount || 0);
+    });
+
+
+  // Dedupe by image similarity
+  const { unique } = await dedupeResults(topMostPerReview, { concurrency: 6, threshold: 3, keep: 'first' });
+  console.log(`[${taskId}] after deduplication: total scraped=${topMostPerReview.length}, uniqueImages=${unique.length}`);
+
+  const uniqueSorted = unique.slice(0, maxResults);
+    logger.info(`[${taskId}] final uniqueSorted length (capped to maxResults=${maxResults}): ${uniqueSorted.length}`);
+
+
+  // Return up to targetUniqueCount results (sorted by review count desc)
+  const finalResults = uniqueSorted.slice(0, targetUniqueCount);
   console.log(`[${taskId}] returning ${finalResults.length} unique results (target was ${targetUniqueCount})`);
   return finalResults;
 

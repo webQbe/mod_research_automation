@@ -41,6 +41,7 @@ const SPREADSHEET_ID = 'google_sheet_id';
   PORT=8080
   WEBHOOK_URL=webhook_appsscript_url
   WEBHOOK_TOKEN=supersecret123
+  MAX_ZIP_RETRIES=5
   ```
 
 #### `data-receiver/` module
