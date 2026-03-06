@@ -1,10 +1,3 @@
-// Add menu on open
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('Merch Export')
-    .addItem('Export Docs by Main Niche', 'buildAndMergeByMainNiche')
-    .addToUi();
-}
 
 
 function buildAndMergeByMainNiche() {
