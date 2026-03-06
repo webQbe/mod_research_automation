@@ -6,6 +6,7 @@ function onOpen() {
     .addItem('Resume', 'processBatch')
     .addItem('Clear Pending', 'stopExportAndClearState')
     .addItem('Export Docs', 'startExport')
+    .addItem('Dedup by ASIN', 'dedupeResultsByASINMark')
     .addToUi();
 }
 
@@ -14,7 +15,6 @@ function onOpen() {
  * Initialize export state and start processing in batches.
  * Call this from your UI/menu instead of calling buildAndMergeByMainNiche() directly.
  */
-// Improved startExport() — uses lock, prevents double-start, schedules first run
 function startExport() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) {
@@ -29,37 +29,53 @@ function startExport() {
       return;
     }
 
-    // prepare state (your previous logic to build groups)
+    // prepare state (adapted to new "tasks" sheet layout)
     const ss = SpreadsheetApp.openById(spreadsheetId);
-    const sheet = ss.getSheetByName('raw_data');
-    if (!sheet) { SpreadsheetApp.getUi().alert('Sheet "raw_data" not found.'); return; }
+    const sheet = ss.getSheetByName('tasks');
+    if (!sheet) { SpreadsheetApp.getUi().alert('Sheet "tasks" not found.'); return; }
 
-    fillMainSub_fillDown_withGeneral(sheet);
+    // ensure main/sub filled down if you still want that behavior
+    try { fillMainSub_fillDown_withGeneral(sheet); } catch (e) {
+      // Non-fatal if helper not present; still continue
+      log('fillMainSub_fillDown_withGeneral failed: ' + (e && e.message));
+    }
+
     const data = sheet.getDataRange().getValues();
-    if (data.length <= 1) { SpreadsheetApp.getUi().alert('No data rows in raw_data.'); return; }
+    if (data.length <= 1) { SpreadsheetApp.getUi().alert('No data rows in tasks.'); return; }
 
-    const header = data[0].map(h=>String(h).trim());
+    const header = data[0].map(h => String(h).trim());
     const rows = data.slice(1);
     const idx = name => header.indexOf(name);
+
+    const colId = idx('id');
     const colMain = idx('main_niche');
     const colSub = idx('sub_niche');
-    const colScreenshot = idx('drive_image_file_id');
-    const colLink = idx('product_link');
-    const colReviews = idx('review_count');
+    const colSearch = idx('search_term');
     const colKeywords = idx('keywords');
+
+    // sanity checks
+    if (colMain < 0 || colSub < 0 || colSearch < 0 || colId < 0) {
+      SpreadsheetApp.getUi().alert('Expected headers missing in tasks sheet. Required: id, main_niche, sub_niche, search_term.');
+      return;
+    }
 
     const groups = {};
     for (const r of rows) {
+      const id = String(r[colId] || '').trim();
       const main = String(r[colMain] || '').trim();
-      if (!main) continue;
-      const sub = String(r[colSub] || 'General').trim();
+      const searchTerm = String(r[colSearch] || '').trim();
+      if (!main || !searchTerm) continue; // skip incomplete tasks
+
+      const sub = String(r[colSub] || 'General').trim() || 'General';
+      const keywordsRaw = colKeywords >= 0 ? String(r[colKeywords] || '').trim() : '';
+
       groups[main] = groups[main] || {};
       groups[main][sub] = groups[main][sub] || [];
+
       groups[main][sub].push({
-        screenshot: String(r[colScreenshot] || '').trim(),
-        link: String(r[colLink] || '').trim(),
-        reviews: String(r[colReviews] || '').trim(),
-        keywordsRaw: String(r[colKeywords] || '').trim()
+        id: id,
+        searchTerm: searchTerm,
+        keywordsRaw: keywordsRaw
       });
     }
 
@@ -116,6 +132,62 @@ function processBatch() {
 
   const startTime = Date.now();
   const TIME_LIMIT_MS = 5 * 60 * 1000 - 10 * 1000; // aim to stop 10s before platform timeout (approx 5min)
+
+  // --- Preload results sheet once per run for quick lookups ---
+  const ss = SpreadsheetApp.openById(ssId);
+  const resultsSheet = ss.getSheetByName('results');
+  let parentResultsMap = {}; // parent_id -> [ rowObj, ... ]
+  if (resultsSheet) {
+    const resData = resultsSheet.getDataRange().getValues();
+    if (resData.length > 1) {
+      const resHeader = resData[0].map(h => String(h).trim());
+      const resRows = resData.slice(1);
+      // determine indices (1-based columns: A parent_id, B rank, C title, D link, E price, F review_count, G drive_file_id, H drive_view_url, I captured_at, J notes)
+      // zero-based indexes for array:
+      const i_parent_id = 0;
+      const i_rank = 1;
+      const i_title = 2;
+      const i_link = 3;
+      const i_price = 4;
+      const i_review_count = 5;
+      const i_drive_file_id = 6;
+      const i_drive_view_url = 7;
+      const i_captured_at = 8;
+      const i_notes = 9;
+
+      for (let r = 0; r < resRows.length; r++) {
+        const row = resRows[r];
+        const parentId = String(row[i_parent_id] || '').trim();
+        if (!parentId) continue;
+        const rowObj = {
+          parent_id: parentId,
+          rank: (() => {
+            const v = row[i_rank];
+            if (typeof v === 'number' && !isNaN(v)) return v;
+            const parsed = parseFloat(String(v || '').replace(/[^\d.\-]/g, ''));
+            return isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
+          })(),
+          title: String(row[i_title] || '').trim(),
+          link: String(row[i_link] || '').trim(),
+          price: String(row[i_price] || '').trim(),
+          review_count: (() => {
+            const v = row[i_review_count];
+            if (typeof v === 'number' && !isNaN(v)) return v;
+            const parsed = parseFloat(String(v || '').replace(/[^\d.\-]/g, ''));
+            return isNaN(parsed) ? 0 : parsed;
+          })(),
+          drive_file_id: String(row[i_drive_file_id] || '').trim(),
+          drive_view_url: String(row[i_drive_view_url] || '').trim(),
+          captured_at: String(row[i_captured_at] || '').trim(),
+          notes: String(row[i_notes] || '').trim()
+        };
+        parentResultsMap[parentId] = parentResultsMap[parentId] || [];
+        parentResultsMap[parentId].push(rowObj);
+      }
+    }
+  } else {
+    log('Warning: results sheet not found. No results will be merged.');
+  }
 
   // Process up to batchSize or until we run out of mains or time
   let processedThisRun = 0;
