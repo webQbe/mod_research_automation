@@ -131,7 +131,7 @@ function processBatch() {
   const tmplId = state.docTemplateId || docTemplateId;
 
   const startTime = Date.now();
-  const TIME_LIMIT_MS = 5 * 60 * 1000 - 10 * 1000; // aim to stop 10s before platform timeout (approx 5min)
+  const TIME_LIMIT_MS = 5 * 60 * 1000 - 10 * 1000; // stop ~10s before platform timeout
 
   // --- Preload results sheet once per run for quick lookups ---
   const ss = SpreadsheetApp.openById(ssId);
@@ -189,18 +189,16 @@ function processBatch() {
     log('Warning: results sheet not found. No results will be merged.');
   }
 
-  // Process up to batchSize or until we run out of mains or time
+  // Process up to batchSize mains (respect time)
   let processedThisRun = 0;
   while (idx < maxIndex && processedThisRun < batchSize && (Date.now() - startTime) < TIME_LIMIT_MS) {
     const main = mains[idx];
     const subGroups = groups[main] || {};
 
     try {
-      // --- create main doc from template (same as your earlier inner loop) ---
       const docName = `Research — ${main} (${new Date().toISOString().slice(0,10)})`;
       // Create mainDoc as a copy of the template so header/footer/styles remain.
-      // Do NOT move main docs into the output folder; leave them in My Drive root.
-      const mainCopyFile = DriveApp.getFileById(docTemplateId).makeCopy(docName);
+      const mainCopyFile = DriveApp.getFileById(tmplId).makeCopy(docName);
       const mainDocId = mainCopyFile.getId();
       const mainDoc = DocumentApp.openById(mainDocId);
       const mainBody = mainDoc.getBody();
@@ -211,29 +209,82 @@ function processBatch() {
       // iterate subgroups of this main
       let firstSub = true;
       for (const sub of Object.keys(subGroups)) {
-        const items = subGroups[sub];
+        const items = subGroups[sub]; // array of task objects { id, searchTerm, ... }
 
-        // create temp sub-doc as copy of template
-        const subCopyName = `TEMP - ${main} / ${sub} (${new Date().toISOString().slice(0,10)})`;
-        const subFile = DriveApp.getFileById(tmplId).makeCopy(subCopyName);
-        const subDocId = subFile.getId();
-        const subDoc = DocumentApp.openById(subDocId);
-
-        // fill subDoc and save it
-        fillSubDocFromData(subDoc, main, sub, items);
-        subDoc.saveAndClose();
-        Utilities.sleep(300); // small pause helps Drive propagate
-
-        if (!firstSub) mainBody.appendPageBreak();
-        firstSub = false;
-
-        // merge and trash temp
-        mergeDocIntoBody(mainBody, subDocId);
-        try { DriveApp.getFileById(subDocId).setTrashed(true); } 
-        catch (e) { 
-          log('Could not trash temp sub doc: ' + e); 
+        // --- NEW: group the tasks by search_term within this sub ---
+        const searchTermMap = {}; // searchTerm -> [taskId,...]
+        for (const t of items) {
+          const s = String(t.searchTerm || '').trim();
+          if (!s) continue;
+          searchTermMap[s] = searchTermMap[s] || [];
+          if (t.id) searchTermMap[s].push(String(t.id).trim());
         }
-      }
+
+        // For each search_term, collect result rows across all parent_ids for that search_term,
+        // filter out DUPLICATE notes, sort by review_count desc, take top 9, and create a temp subdoc per search_term.
+        let firstSearchTermForSub = true;
+        for (const searchTerm of Object.keys(searchTermMap)) {
+          const parentIds = searchTermMap[searchTerm]; // array of task ids
+
+          // gather results
+          let combinedResults = [];
+          for (const pid of parentIds) {
+            const arr = parentResultsMap[pid];
+            if (Array.isArray(arr)) {
+              combinedResults = combinedResults.concat(arr);
+            }
+          }
+
+          // filter out duplicates marked in notes (case-insensitive) and deduplicate by link if needed
+          combinedResults = combinedResults.filter(r => {
+            if (!r) return false;
+            if (r.notes && /DUPLICATE/i.test(r.notes)) return false;
+            return true;
+          });
+
+          // optional: dedupe combinedResults by link (if multiple parent ids pointed to same result)
+          const seenLinks = new Set();
+          combinedResults = combinedResults.filter(r => {
+            const linkKey = (r.link || '').trim();
+            if (!linkKey) return false;
+            if (seenLinks.has(linkKey)) return false;
+            seenLinks.add(linkKey);
+            return true;
+          });
+
+          // sort by review_count desc (highest first)
+          combinedResults.sort((a,b) => {
+            const ra = (typeof a.review_count === 'number') ? a.review_count : 0;
+            const rb = (typeof b.review_count === 'number') ? b.review_count : 0;
+            return rb - ra;
+          });
+
+          // take top 9
+          const topResults = combinedResults.slice(0, 9);
+
+          // create temp sub-doc as copy of template and fill with topResults
+          const subCopyName = `TEMP - ${main} / ${sub} / ${searchTerm} (${new Date().toISOString().slice(0,10)})`;
+          const subFile = DriveApp.getFileById(tmplId).makeCopy(subCopyName);
+          const subDocId = subFile.getId();
+          const subDoc = DocumentApp.openById(subDocId);
+
+          // You must ensure fillSubDocFromData can accept the shape of topResults items.
+          // Each item here has: { title, link, price, review_count, drive_file_id, drive_view_url, captured_at, rank, parent_id }
+          // If your existing fillSubDocFromData expects a different shape, adapt it accordingly.
+          fillSubDocFromData(subDoc, main, sub + " — " + searchTerm, topResults);
+          subDoc.saveAndClose();
+          Utilities.sleep(300); // small pause helps Drive propagate
+
+          if (!firstSub || !firstSearchTermForSub) mainBody.appendPageBreak();
+          firstSub = false;
+          firstSearchTermForSub = false;
+
+          // merge and trash temp
+          mergeDocIntoBody(mainBody, subDocId);
+          try { DriveApp.getFileById(subDocId).setTrashed(true); }
+          catch (e) { log('Could not trash temp sub doc: ' + e); }
+        } // end for each searchTerm
+      } // end for each sub
 
       mainDoc.saveAndClose();
       created.push({ main: main, url: mainDoc.getUrl() });
@@ -241,7 +292,7 @@ function processBatch() {
     } catch (e) {
       log('Error creating main doc for ' + main + ': ' + e);
       // push a placeholder so we don't get stuck
-      created.push({ main: main, url: '' , error: String(e)});
+      created.push({ main: main, url: '', error: String(e) });
     }
 
     // increment
@@ -269,7 +320,7 @@ function processBatch() {
     startMergeChunks();
   } catch (e) {
     log('Failed to start merge chunks: ' + e);
-  } 
+}
   return;
 }
 
