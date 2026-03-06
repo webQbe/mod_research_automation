@@ -1,200 +1,172 @@
 // ---------- doPost ----------
-function doPost(e){
-  // Acquire lock (blocks other requests)
+function doPost(e) {
+  // Acquire script-level lock to serialize sheet/drive writes
   const lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(30000);  // Wait up to 30 seconds for lock
-  } catch (lockErr) {
-    Logger.log('Lock timeout: ' + lockErr);
-    return jsonOut({ 
-      ok: false, 
-      error: 'Server busy, please retry',
-      details: 'Could not acquire lock - too many concurrent requests'
-    }, 503);
+  const got = lock.tryLock(30000); // wait up to 30s
+  if (!got) {
+    return jsonOut({ ok:false, error: 'Server busy, please retry' });
   }
+
   try {
-    if (!e || !e.postData || !e.postData.contents) return jsonOut({ ok:false, error:'No POST body' }, 400);
-    const payload = JSON.parse(e.postData.contents || '{}');
+    if (!e || !e.postData || !e.postData.contents) {
+      return jsonOut({ ok:false, error: 'No POST body' });
+    }
+    const payload = JSON.parse(e.postData.contents);
 
     // token check
-    const token = payload.token || '';
-    if (SECRET_TOKEN && token !== SECRET_TOKEN) return jsonOut({ ok:false, error:'Invalid token' }, 403);
+    if (WEBHOOK_TOKEN && payload.token !== WEBHOOK_TOKEN) {
+      return jsonOut({ ok:false, error:'Invalid token' }, 403);
+    }
 
-    const searchTerm = (payload.search_term || '').toString().trim();
-    if (!searchTerm) return jsonOut({ ok:false, error:'search_term is required' }, 400);
-
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
-    _ensureHeaderRowExists(sheet);
-    const folder = _getOrCreateFolder();
-
-    // Parent row values (A..G)
-    const id = Utilities.getUuid();
     const mainNiche = payload.main_niche || '';
     const subNiche = payload.sub_niche || '';
     const keywords = payload.keywords || '';
-    const parentRow = [ id, mainNiche, subNiche, searchTerm, keywords, '', '' ];
-    sheet.appendRow(parentRow);
-    const sheetRow = sheet.getLastRow();
-    Logger.log('Acquired row ' + sheetRow + ' for search: ' + searchTerm);
+    const searchTerm = (payload.search_term || '').toString().trim();
+    if (!searchTerm) {
+      return jsonOut({ ok:false, error: 'search_term required' }, 400);
+    }
 
-    // Prepare results block: write to rows sheetRow .. sheetRow + max - 1
-    const scrapedArr = Array.isArray(payload.scrapeResult) ? payload.scrapeResult : (Array.isArray(payload.results) ? payload.results : []);
-    Logger.log('Received results count: ' + scrapedArr.length);
-    Logger.log('Results data: ' + JSON.stringify(scrapedArr));
+    const scrapedArr = Array.isArray(payload.scrapeResult) ? payload.scrapeResult : [];
 
-    // Build rows for H..L (5 columns per result)
-    const rowsToWrite = [];
-    const statusUpdates = []; // for column F
-    const nowIso = new Date().toISOString();
-    const maxToWrite = Math.min(MAX_RESULTS_TO_WRITE, scrapedArr.length);
-    for (let i = 0; i < maxToWrite; i++) {
+    const ss = ensureSheetsAndHeaders();
+
+    // Append parent/task row to tasks sheet
+    const tasksSheet = ss.getSheetByName(TASKS_SHEET);
+    const parentId = Utilities.getUuid();
+    const createdAt = new Date().toISOString();
+    const parentRow = [ parentId, mainNiche, subNiche, searchTerm, keywords, 'in-progress', '', createdAt ];
+    tasksSheet.appendRow(parentRow);
+    const parentRowNum = tasksSheet.getLastRow();
+
+    // Build results rows for results sheet
+    const resultsSheet = ss.getSheetByName(RESULTS_SHEET);
+    const resultRows = []; // each row: [parent_id, rank, title, link, price, review_count, drive_file_id, drive_view_url, captured_at]
+
+    for (let i = 0; i < scrapedArr.length; i++) {
       const r = scrapedArr[i] || {};
+      const rank = r.rank || (i+1);
+      const title = r.title || '';
       const link = r.link || '';
       const price = r.price || '';
-      const reviewCount = (r.reviewCount !== undefined && r.reviewCount !== null && r.reviewCount < 1000000000) ? String(r.reviewCount) : '';
-      const capturedAt = r.capturedAt || nowIso;
+      const reviewCount = r.reviewCount || r.reviewCountFormatted || '';
+      const capturedAt = r.capturedAt || new Date().toISOString();
 
       let fileId = '';
-      let fileViewUrl = '';
-
-      if (r.image) {
-        try {
-          const {id:fileIdRes, viewUrl:fileViewUrlRes} = _fetchAndSaveImageReturnBoth(r.image, folder, `${searchTerm}_r${i+1}`);
-          fileId = fileIdRes || '';
-          fileViewUrl = fileViewUrlRes || '';
-        } catch (err) {
-          fileId = '';
-          fileViewUrl = '';
-        }
+      let viewUrl = '';
+      // If payload includes image_base64 prefer that
+      if (r.image_base64) {
+        const out = _saveImageAndReturn({ imageBase64: r.image_base64, filenameBase: `${parentId}_r${rank}` });
+        fileId = out.id || '';
+        viewUrl = out.viewUrl || '';
+      } else if (r.image) {
+        const out = _saveImageAndReturn({ imageUrl: r.image, filenameBase: `${parentId}_r${rank}` });
+        fileId = out.id || '';
+        viewUrl = out.viewUrl || '';
       }
 
-      rowsToWrite.push([ link, price, reviewCount, capturedAt, fileId ]);
-
-      // status for this row (F column)
-      const status = fileId ? 'Done' : 'no-image';
-      statusUpdates.push({
-        range: `${SHEET_NAME}!F${sheetRow + i}`,
-        values: [[ status ]]
-      });
+      resultRows.push([ parentId, rank, title, link, price, reviewCount, fileId, viewUrl, capturedAt ]);
     }
 
-    // If rowsToWrite length < MAX_RESULTS_TO_WRITE, pad with empty rows so block is rectangular
-    while (rowsToWrite.length < MAX_RESULTS_TO_WRITE) {
-      rowsToWrite.push(['', '', '', '', '']);
-      statusUpdates.push({
-        range: `${SHEET_NAME}!F${sheetRow + rowsToWrite.length - 1}`,
-        values: [[ 'no-result' ]]
-      });
+    // Write result rows in one setValues call if there are any
+    if (resultRows.length > 0) {
+      const startRow = resultsSheet.getLastRow() + 1;
+      resultsSheet.getRange(startRow, 1, resultRows.length, resultRows[0].length).setValues(resultRows);
     }
 
-    // Write block H{sheetRow}:M{endRow}
-    const startCol = _colToLetter(8); // H
-    const endCol = _colToLetter(12);  // L
-    const endRow = sheetRow + rowsToWrite.length - 1;
-    const rangeBlock = `${SHEET_NAME}!${startCol}${sheetRow}:${endCol}${endRow}`;
-    sheet.getRange(rangeBlock).setValues(rowsToWrite);
+    // Update parent status to 'Done' if at least one result row was saved, else 'no-result'
+    const anySaved = resultRows.length > 0;
+    tasksSheet.getRange(parentRowNum, 6).setValue(anySaved ? 'Done' : 'no-result');
 
-    // Batch update statuses for column F
-    // ---------- Write statuses for column F (fixed indexing) ----------
-    // rowsToWrite elements: [ link, price, reviewCount, capturedAt, fileId ]
-    // So fileId is at index 4 (0-based)
-    const fileIdIndex = 4;
-    const statusVals = rowsToWrite.map(r => {
-      const fileId = (Array.isArray(r) ? r[fileIdIndex] : '');
-      return [ fileId ? 'Done' : 'no-image' ];
-    });
+    // Optionally write count into parent notes column
+    tasksSheet.getRange(parentRowNum, 7).setValue(`results:${resultRows.length}`);
 
-    // sheetRow is the starting row for the results we wrote
-    const statusStartRow = sheetRow;
-    const statusNumRows = statusVals.length;
-    if (statusNumRows > 0) {
-      // column 6 => F
-      sheet.getRange(statusStartRow, 6, statusNumRows, 1).setValues(statusVals);
-    }
-
-    // Also set parent-row status (F at sheetRow) to 'Done' if at least one fileId exists among written rows
-    const anyFileId = rowsToWrite.some(r => Array.isArray(r) && !!r[fileIdIndex]);
-    sheet.getRange(`${SHEET_NAME}!F${sheetRow}`).setValue(anyFileId ? 'Done' : 'no-image');
-
-    // Fix the summary mapping in the response: link is r[0], fileId is r[4]
+    // Return helpful response
     return jsonOut({
       ok: true,
       version: WEBHOOK_VERSION,
-      sheetRow,
-      writtenRows: rowsToWrite.length,
-      summary: rowsToWrite.map((r, idx) => ({ rank: idx+1, link: r[0] || null, fileId: r[4] || null }))
-    }, 200);
+      parentId,
+      sheetRow: parentRowNum,
+      resultsWritten: resultRows.length
+    });
 
+  } catch (err) {
+    return jsonOut({ ok:false, error: String(err), stack: err && err.stack ? err.stack : '' });
   } finally {
-      try {
-        lock.releaseLock();
-        Logger.log('Lock released');
-      } catch (e) {
-        Logger.log('Failed to release lock: ' + e);
-        // Lock will auto-release after 30 seconds
-      }
+    try { lock.releaseLock(); } catch (e) {}
   }
-} 
+}
 
 // ---------- helpers ----------
-function jsonOut(obj) {
+function jsonOut(obj, code) {
   const out = ContentService.createTextOutput(JSON.stringify(obj));
   out.setMimeType(ContentService.MimeType.JSON);
+  if (code) {
+    // Apps Script doesn't support setting HTTP status directly in doPost return value.
+    // But returning JSON with code is fine. Platform sets 200 by default.
+  }
   return out;
 }
 
-function _ensureHeaderRowExists(sheet) {
+function _ensureHeaderRowExists(ss, sheetName, headerRow) {
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) sheet = ss.insertSheet(sheetName);
   const lastRow = sheet.getLastRow();
   if (lastRow === 0) {
-    sheet.getRange(1,1,1,HEADER_ROW.length).setValues([HEADER_ROW]);
-    return;
+    sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
+  } else {
+    // if header missing or different, write/overwrite
+    const existing = sheet.getRange(1,1,1, headerRow.length).getValues()[0];
+    let needs = false;
+    for (let i=0;i<headerRow.length;i++) {
+      if ((existing[i]||'').toString().trim() !== headerRow[i]) { needs = true; break; }
+    }
+    if (needs) sheet.getRange(1,1,1, headerRow.length).setValues([headerRow]);
   }
-  const existing = sheet.getRange(1,1,1,HEADER_ROW.length).getValues()[0];
-  let needsWrite = false;
-  for (let i=0;i<HEADER_ROW.length;i++){
-    if ((existing[i]||'').toString().trim() !== HEADER_ROW[i]) { needsWrite = true; break; }
-  }
-  if (needsWrite) sheet.getRange(1,1,1,HEADER_ROW.length).setValues([HEADER_ROW]);
 }
 
-function _getOrCreateFolder() {
-  if (FOLDER_ID && FOLDER_ID.length) {
-    try { return DriveApp.getFolderById(FOLDER_ID); } catch(e){ /* fallthrough */ }
-  }
-  const it = DriveApp.getFoldersByName(OUTPUT_FOLDER_NAME);
+function _getOrCreateFolderByName(name, optionalId) {
+  try {
+    if (optionalId) return DriveApp.getFolderById(optionalId);
+  } catch(e) {}
+  const it = DriveApp.getFoldersByName(name);
   if (it.hasNext()) return it.next();
-  return DriveApp.createFolder(OUTPUT_FOLDER_NAME);
+  return DriveApp.createFolder(name);
 }
 
-function _fetchAndSaveImageReturnBoth(imageUrl, folder, baseName) {
-  const res = UrlFetchApp.fetch(imageUrl, { muteHttpExceptions: true, followRedirects: true });
-  if (!res || res.getResponseCode() !== 200) throw new Error('Image fetch failed status=' + (res ? res.getResponseCode() : 'no-res'));
-  const blob = res.getBlob();
-  const ext = _guessExtension(blob.getContentType(), imageUrl);
-  const safe = (baseName||'img').replace(/[^a-z0-9_\-]/ig,'_').substring(0,60) + '.' + ext;
-  const file = _getOrCreateFolder().createFile(blob.setName(safe));
-  try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) {}
-  return { id: file.getId(), viewUrl: `https://drive.google.com/uc?export=view&id=${file.getId()}` };
-}
+// Save an image either from a URL or from base64 payload:
+// returns { id, viewUrl }
+function _saveImageAndReturn({ imageUrl, imageBase64, filenameBase = 'img' }) {
+  const folder = _getOrCreateFolderByName(OUTPUT_FOLDER_NAME);
+  let blob;
+  try {
+    if (imageBase64) {
+      // imageBase64 should be raw base64 (no data: prefix) or allow data: prefix
+      const raw = String(imageBase64);
+      const base = raw.indexOf('base64,') !== -1 ? raw.split('base64,')[1] : raw;
+      const bytes = Utilities.base64Decode(base);
+      blob = Utilities.newBlob(bytes, 'image/png', filenameBase);
+    } else if (imageUrl) {
+      const res = UrlFetchApp.fetch(imageUrl, { muteHttpExceptions: true, followRedirects: true, validateHttpsCertificates: true });
+      if (res.getResponseCode() !== 200) throw new Error('Image fetch failed status=' + res.getResponseCode());
+      blob = res.getBlob();
+      // set a filename
+      blob.setName(filenameBase);
+    } else {
+      return { id: '', viewUrl: '' };
+    }
 
-function _guessExtension(contentType, url) {
-  if (contentType) {
-    if (contentType.indexOf('jpeg') !== -1) return 'jpg';
-    if (contentType.indexOf('png') !== -1) return 'png';
-    if (contentType.indexOf('gif') !== -1) return 'gif';
+    const file = folder.createFile(blob);
+    try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch(e) {}
+    return { id: file.getId(), viewUrl: `https://drive.google.com/uc?export=view&id=${file.getId()}` };
+  } catch (err) {
+    // return blank on error so webhook doesn't crash
+    return { id: '', viewUrl: '' };
   }
-  const m = (url||'').match(/\.([a-z0-9]{2,4})(?:\?|$)/i);
-  if (m) return m[1].toLowerCase();
-  return 'png';
 }
 
-function _colToLetter(col) {
-  let letter = '';
-  while (col>0) {
-    const mod = (col-1)%26;
-    letter = String.fromCharCode(65+mod) + letter;
-    col = Math.floor((col-1)/26);
-  }
-  return letter;
-} 
+function ensureSheetsAndHeaders() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  _ensureHeaderRowExists(ss, TASKS_SHEET, ['id','main_niche','sub_niche','search_term','keywords','status','notes','created_at']);
+  _ensureHeaderRowExists(ss, RESULTS_SHEET, ['parent_id','rank','title','link','price','review_count','drive_file_id','drive_view_url','captured_at']);
+  return ss;
+}
