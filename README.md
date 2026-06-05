@@ -80,19 +80,27 @@ React Form → poc-worker (Playwright scraper)
 ---
 
 ## Screenshots
-![single job submission](./images/react_single.jpg)![bulk job submission](./images/react_csv.jpg)
+### Single job submission
+![single job submission](./images/react_single.jpg)
+### Bulk job submission
+![bulk job submission](./images/react_csv.jpg)
+### Google Sheet with `Tasks` tab
 ![Google Sheet with Tasks tab](./images/sheet_tasks.jpg)
+### Google Sheet with `Results` tab
 ![Google Sheet with Results tab](./images/sheet_results.jpg)
+### Exported combined doc
 ![Example exported Combined doc](./images/com_doc.jpg)
+### Master Index doc
 ![Master Index](./images/master.jpg)
-![Drive folder with saved product images ](./images/drive.jpg)
+### Drive folder with saved product images
+![Drive folder with saved product images](./images/drive.jpg)
 
 ---
 
 ## Demo video
 
 <a href="https://youtu.be/WqCKz3wZN7Y" target="_blank">
-  <img src="./images/portfolio-thumb.png" alt="Watch the video" />
+  <img src="./images/portfolio-thumb.png" alt="Watch the video (Opens in YouTube)" width="560" />
 </a>
 
 ---
