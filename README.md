@@ -91,7 +91,9 @@ React Form → poc-worker (Playwright scraper)
 
 ## Demo video
 
-[![Watch the video](./images/portfolio-thumb.png)](https://youtu.be/WqCKz3wZN7Y)
+<a href="https://youtu.be/WqCKz3wZN7Y" target="_blank">
+  <img src="./images/portfolio-thumb.png" alt="Watch the video" />
+</a>
 
 ---
 
